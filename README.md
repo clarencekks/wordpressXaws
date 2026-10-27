@@ -2489,18 +2489,24 @@ ok
 
 1. 主控台上方搜尋 **VPC** → 左側 **Security → Security groups**。
 2. 勾選 **`wp-web-sg`**（如果名稱欄是空的，看 **Security group name** 欄）→ 下方點 **Inbound rules** 分頁 → 按 **Edit inbound rules**。
-3. 你會看到一條規則：Type `HTTP`、Port `80`、Source `Custom`、`0.0.0.0/0`。在這一條上修改：
+3. 你會看到一條規則：Type `HTTP`、Port `80`、Source `Custom`、`0.0.0.0/0`。
 
-| 欄位 | 改之前 | 改之後 |
-|---|---|---|
-| **Type** | HTTP | HTTP（不動） |
-| **Port range** | 80 | 80（不動） |
-| **Source** | Custom、`0.0.0.0/0` | **Custom**：先按 `0.0.0.0/0` 旁邊的 **X** 刪掉它，再在搜尋框輸入 `wp-alb` → 選 **`sg-xxxxxxxx (wp-alb-sg)`** |
-| **Description** | （空白） | `HTTP from ALB only`（選填，只能用英文） |
+   ⚠️ **不能直接把這條的 Source 改成安全群組。** 主控台會顯示錯誤 *You may not specify a referenced group id for an existing IPv4 CIDR rule.*，因為「IP 範圍」的規則不能改成「安全群組」來源。正確做法是**刪掉舊的，再新增一條**：
 
-   ⚠️ 來源欄裡**只能留下** `wp-alb-sg` 一個。如果 `0.0.0.0/0` 還在，就等於沒改。
-   ⚠️ 如果還有其他規則（例如 Source 是 `::/0` 的 IPv6 HTTP 規則、Port 22、All traffic），按該列最右邊的 **Delete** 刪掉。最後**只剩一條**規則。
+   **3-1.** 在 `0.0.0.0/0` 那一列，按最右邊的 **Delete**。
+
+   **3-2.** 按左下 **Add rule**，新的一列這樣填：
+
+| 欄位 | 設定 |
+|---|---|
+| **Type** | **HTTP**（Port range 自動帶出 `80`） |
+| **Source** | **Custom** → 在搜尋框輸入 `wp-alb` → 選 **`sg-xxxxxxxx (wp-alb-sg)`** |
+| **Description** | `HTTP from ALB only`（選填，只能用英文） |
+
+   **3-3.** 如果還有其他規則（例如 Source 是 `::/0` 的 IPv6 HTTP 規則、Port 22、All traffic），也按 **Delete** 刪掉。畫面上最後**只剩一條**：HTTP、80、`wp-alb-sg`。
+
    ⚠️ 搜尋 `wp-alb` 找不到時，代表 `wp-alb-sg` 不在 `wp-vpc` 裡，回到 ① 檢查。
+   💡 刪除和新增會在同一次 Save 一起生效，ALB 不會中斷。如果剛才已經出現上面的錯誤，先按 **Cancel**，再重新按 **Edit inbound rules** 照 3-1 做。
 
 4. 按右下 **Save rules**。畫面上方出現綠色的 *Inbound security group rules successfully modified*，就完成了。改完**立刻生效**，不用重開主機。
 
@@ -3665,7 +3671,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
-| 2.3 ④（10/27 補充） | 收緊 `wp-web-sg` 只有一行說明 | 改成主控台逐欄位步驟、先加後刪的 CLI 做法、驗證腳本（規則、ALB 通、EIP 不通）與排錯表；修正「做完 ④ 網站就無法瀏覽」的說法 |
+| 2.3 ④（10/27 補充、實作） | 收緊 `wp-web-sg` 只有一行說明；實作時直接改 Source 出現 *You may not specify a referenced group id for an existing IPv4 CIDR rule* | 改成主控台「刪掉舊規則、Add rule 新增」的步驟、先加後刪的 CLI 做法、驗證腳本（規則、ALB 通、EIP 不通）與排錯表；修正「做完 ④ 網站就無法瀏覽」的說法 |
 | 2.3 ③驗證（10/27 實作） | 網址只印在輸出最上方容易被捲走；實際首頁回應 200，不是 301 | 最後一行再印一次 ALB DNS name，並說明主控台哪裡複製；說明首頁 200 或 301 都正常 |
 | 2.3 ②③（10/27 補充） | 目標群組和 ALB 只有簡短說明 | 改成逐欄位設定表（含 Advanced health check）、CLI 做法、驗證腳本與 unhealthy 排錯表；說明 `unused` 狀態和首頁 301 轉址是正常的 |
 | 2.3 ①（10/27 補充） | ALB 安全群組只有一行說明 | 改成和 `wp-efs-sg` 相同的格式：用途與兩階段示意圖、主控台／CLI 兩種做法、驗證與排錯表 |
