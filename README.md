@@ -1604,6 +1604,7 @@ aws s3 cp s3://$BUCKET/db/$LATEST - | gunzip | tail -n 1
 **3. 桶的設定正確**（CloudShell）
 
 ```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)   # CloudShell 重新連線後變數會消失，每次都重新取得
 aws s3api get-public-access-block --bucket wp-backup-$ACCOUNT_ID \
   --query "PublicAccessBlockConfiguration" --output table
 aws s3api get-bucket-lifecycle-configuration --bucket wp-backup-$ACCOUNT_ID \
@@ -1612,6 +1613,8 @@ aws s3api get-bucket-lifecycle-configuration --bucket wp-backup-$ACCOUNT_ID \
 
 - 第一個表格四項都是 `True`（完全不公開）。
 - 第二個表格顯示 `expire-db-30d | db/ | 30 | Enabled`。
+
+> 出現 `NoSuchBucket`：用 `aws s3 ls | grep wp-backup` 列出實際的桶名稱。名稱和 `wp-backup-你的帳號ID` 不同（例如多了 `-ap-northeast-1-an`），代表建立時選了 Account Regional namespace，請照步驟 1 的說明刪除後重建；什麼都沒列出，代表桶沒有建立成功，請重做步驟 1。
 
 **4. 自動排程已設定**（Session Manager，root）
 
