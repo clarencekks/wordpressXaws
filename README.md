@@ -2120,7 +2120,72 @@ systemctl start php-fpm nginx
 
 ### 2.3 建立 ALB（負載平衡器）
 
-**① ALB 安全群組**：**VPC → Security groups → Create** → 名稱 `wp-alb-sg`、**VPC 改成 `wp-vpc`**（預設是 default VPC，記得改）、Inbound：HTTP 80 來源 `0.0.0.0/0`（暫時，2.5 會收緊）。
+#### ① 建立 ALB 專用的安全群組 `wp-alb-sg`
+
+**為什麼需要**：ALB（負載平衡器）是網站新的「大門」，所有訪客的請求都會先到 ALB，再由 ALB 轉給後面的 WordPress 主機。ALB 也有自己的防火牆，我們要規定**誰可以連到 ALB 的 Port 80（HTTP）**。
+
+這個安全群組會分兩個階段設定：
+
+```
+現在（2.3）：  任何人 ──HTTP 80──► wp-alb-sg 的 ALB ──► WordPress 主機    （先開放，方便測試）
+2.5 之後：     CloudFront ──HTTP 80──► wp-alb-sg 的 ALB                    （只允許 CloudFront）
+               其他來源   ──────────► ❌ 擋下
+```
+
+> 為什麼現在先開放給所有人（`0.0.0.0/0`）？因為 CloudFront 要到 2.4 才會建立。先開放，才能在 2.3 用 ALB 的網址測試，確認 ALB 本身運作正常。2.5 會把來源改成只允許 CloudFront。
+
+> 和 `wp-web-sg`、`wp-efs-sg` 的差別：那兩個的來源是「另一個安全群組」，代表只允許特定的 AWS 資源。`wp-alb-sg` 面對的是網際網路上的訪客，所以來源是 IP 範圍（`0.0.0.0/0` 代表所有 IPv4 位址）。
+
+下面兩種方法**擇一**即可。
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **VPC** → 左側 **Security groups** → 右上 **Create security group**。
+2. **Basic details**：
+   - **Security group name**：`wp-alb-sg`
+   - **Description**：`WordPress ALB`（必填，只能用英文）
+   - **VPC**：⚠️ **點開下拉選單，把預設的 default VPC 改成 `wp-vpc`**（顯示為 `vpc-xxxxxxxx (wp-vpc)`）。建錯 VPC，建立 ALB 時會在清單中找不到這個安全群組。
+3. **Inbound rules** → **Add rule**：
+   - **Type**：下拉選單選 **HTTP**（Protocol 和 Port range 會自動帶入 `TCP`、`80`）
+   - **Source**：選 **Anywhere-IPv4**（會自動帶入 `0.0.0.0/0`）
+   - **Description**（選填）：`Temporary - restrict to CloudFront in 2.5`
+   - **不要加 HTTPS（443）**：HTTPS 由 CloudFront 處理，CloudFront 和 ALB 之間用 HTTP 80 連線（見 2.4）。
+4. **Outbound rules**：保持預設（全部允許）。ALB 需要對外連線，才能把請求轉給後面的主機並執行健康檢查。
+5. 拉到最下面按 **Create security group**。
+
+**方法 B：CloudShell 指令**
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+ALB_SG=$(aws ec2 create-security-group --group-name wp-alb-sg --description "WordPress ALB" \
+  --vpc-id $VPC_ID --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0
+echo "✅ 已建立 wp-alb-sg：$ALB_SG（暫時允許所有人連 HTTP 80）"
+```
+
+✅ **驗證①**（CloudShell）：
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+echo "wp-vpc 的 ID：$VPC_ID"
+aws ec2 describe-security-groups --filters Name=group-name,Values=wp-alb-sg \
+  --query "SecurityGroups[0].{Name:GroupName, VPC:VpcId, Port:IpPermissions[0].FromPort, Source:IpPermissions[0].IpRanges[0].CidrIp, Rules:length(IpPermissions)}" \
+  --output table
+```
+
+正確結果：
+- **VPC** 和第一行印出的 `wp-vpc` ID 相同。
+- **Port** 是 `80`，**Source** 是 `0.0.0.0/0`。
+- **Rules** 是 `1`，代表只有這一條規則。
+
+| 出現的狀況 | 解法 |
+|---|---|
+| 表格的值都是 `None` | 找不到 `wp-alb-sg`，可能建在其他區域，或名稱打錯 |
+| VPC 和 `wp-vpc` 不同 | 建錯 VPC 了。安全群組不能更換 VPC：勾選它 → **Actions → Delete security groups**，再重新建立 |
+| `InvalidGroup.Duplicate`（方法 B） | 已經建立過了，不用重建，直接做驗證 |
+| Rules 大於 1 | 多加了規則。到 **Inbound rules** → **Edit inbound rules**，只保留 HTTP 80 那一條 |
+
+> 記下 `wp-alb-sg`：③ 建立 ALB 時要選它；④ 會把 `wp-web-sg` 的來源改成它；2.5 會把它的來源改成只允許 CloudFront。
 
 **② 目標群組**：
 1. **EC2 → Target Groups → Create target group**。
@@ -3209,6 +3274,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.3 ①（10/27 補充） | ALB 安全群組只有一行說明 | 改成和 `wp-efs-sg` 相同的格式：用途與兩階段示意圖、主控台／CLI 兩種做法、驗證與排錯表 |
 | 2.2（10/27 補充） | 建立 EFS 安全群組與 EFS 的步驟太簡略，搬移指令沒有解釋（3-3～3-6 再加強：逐行解釋、正確畫面、每步完成後的狀態） | 改寫成 4 個步驟：安全群組（主控台／CLI）、EFS 逐欄位設定、逐段解釋的搬移指令、一鍵驗證；加上排錯表與還原方法 |
 | 2.1 驗證 3（10/27 補充） | 依賴前面設定的變數，CloudShell 重新連線後出現 `NoSuchBucket` | 改成可單獨執行並自動判斷 ✅／❌，新增區域與加密檢查、正確輸出範例和每項 ❌ 的修正方法 |
 | 2.1 驗證 2（10/27 補充） | 要手動填檔名，也沒解釋指令 | 自動抓最新備份檔；拆成 4 個小步驟（找檔案、看開頭、數資料表、看結尾），逐段解釋指令並附正確輸出與判斷表 |
