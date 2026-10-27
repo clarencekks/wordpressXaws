@@ -2179,19 +2179,280 @@ aws ec2 describe-security-groups --filters Name=group-name,Values=wp-alb-sg \
 
 > 記下 `wp-alb-sg`：③ 建立 ALB 時要選它；④ 會把 `wp-web-sg` 的來源改成它；2.5 會把它的來源改成只允許 CloudFront。
 
-**② 目標群組**：
-1. **EC2 → Target Groups → Create target group**。
-2. Target type **Instances**；Name `wp-tg`；Protocol HTTP、Port 80；VPC `wp-vpc`。
-3. Health checks：Path 填 **`/healthz`**；展開 Advanced → Healthy threshold `2`、Interval `15` 秒。
-4. Next → 勾選 `wp-web-1` → **Include as pending below** → **Create target group**。
+#### ② 建立目標群組 `wp-tg`
 
-**③ ALB**：
-1. **EC2 → Load Balancers → Create load balancer → Application Load Balancer**。
-2. Name `wp-alb`；Scheme **Internet-facing**；IP type IPv4。
-3. Network mapping：VPC `wp-vpc`，勾選兩個 AZ，各選 **public** 子網路。
-4. Security groups：移除 default，選 `wp-alb-sg`。
-5. Listeners：HTTP 80 → Default action **Forward to `wp-tg`**。
-6. **Create load balancer**，等狀態變 Active（約 3–5 分鐘），複製 **DNS name**（`wp-alb-xxxx.ap-northeast-1.elb.amazonaws.com`）。
+**為什麼需要**：ALB 本身只負責接收請求，還需要知道「要把請求轉給誰」。**目標群組（Target Group）**就是這份「後端主機名單」，再加上一套**健康檢查**規則。ALB 會定期檢查名單上的每台主機，**只把流量送給健康的主機**；壞掉的主機會自動被排除，修好後再自動加回來。
+
+```
+訪客 ──► ALB ──► 目標群組 wp-tg ──┬─► wp-web-1     ✅ healthy   → 會收到流量
+                                  └─► （之後 ASG 新增的主機）     → 檢查通過才會收到流量
+          ALB 每 15 秒對每台主機請求一次 http://主機/healthz，回應 200 才算健康
+```
+
+> 名詞：
+> - **Target（目標）**：接收流量的後端，這裡是 EC2 主機。
+> - **Health check（健康檢查）**：ALB 定期請求一個網址，依回應判斷主機是否正常。
+> - **Healthy／Unhealthy threshold**：連續成功或失敗幾次，才把主機判定為健康或不健康，避免偶發狀況造成誤判。
+
+> **為什麼健康檢查用 `/healthz`，不用首頁 `/`？** WordPress 首頁可能回應 301 或 302 轉址（例如轉到舊網址），ALB 會把它當成失敗。`/healthz` 是 1.7 在 Nginx 設定的固定網址，永遠回應 200 和 `ok`，而且不經過 PHP 和資料庫，檢查又快又穩定。缺點是 PHP 或資料庫壞掉時偵測不到，這部分由 2.8 的 5xx 告警和 Phase 3 的 AI Agent 負責。
+
+下面兩種方法**擇一**即可。
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **EC2** → 左側選單往下捲到 **Load Balancing → Target Groups** → 右上 **Create target group**。
+
+**Step 1：Specify group details（基本設定）**
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Choose a target type** | **Instances** | 目標是 EC2 主機 |
+| **Target group name** | `wp-tg` | |
+| **Protocol : Port** | **HTTP** : `80` | ALB 用 HTTP 80 連到主機（主機的 Nginx 監聽 80） |
+| **IP address type** | **IPv4** | |
+| **VPC** | ⚠️ 改成 **`wp-vpc`** | 預設是 default VPC。選錯的話，下一步會看不到 `wp-web-1` |
+| **Protocol version** | **HTTP1**（預設） | |
+
+**Health checks（健康檢查）** 區塊：
+
+| 欄位 | 設定 |
+|---|---|
+| **Health check protocol** | **HTTP** |
+| **Health check path** | **`/healthz`**（⚠️ 預設是 `/`，一定要改） |
+
+展開 **Advanced health check settings**：
+
+| 欄位 | 設定 | 意思 |
+|---|---|---|
+| **Health check port** | **Traffic port**（預設） | 用上面設定的 Port 80 檢查 |
+| **Healthy threshold** | `2` | 連續成功 2 次就判定為健康（預設 5 次，改小可以更快上線） |
+| **Unhealthy threshold** | `2` | 連續失敗 2 次就判定為不健康 |
+| **Timeout** | `5` 秒 | 超過 5 秒沒回應就算失敗 |
+| **Interval** | `15` 秒 | 每 15 秒檢查一次（預設 30 秒） |
+| **Success codes** | `200` | 回應 200 才算成功 |
+
+按右下 **Next**。
+
+**Step 2：Register targets（加入主機）**
+
+1. **Available instances** 清單中，勾選 **`wp-web-1`**。
+2. 下方 **Ports for the selected instances** 保持 `80`。
+3. 按 **Include as pending below**。下方 **Review targets** 會出現 `wp-web-1`，狀態是 *Pending*。
+4. 按右下 **Create target group**。
+
+**方法 B：CloudShell 指令**
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+
+# 建立目標群組（含健康檢查設定）
+TG_ARN=$(aws elbv2 create-target-group --name wp-tg --target-type instance \
+  --protocol HTTP --port 80 --vpc-id $VPC_ID \
+  --health-check-protocol HTTP --health-check-path /healthz \
+  --health-check-interval-seconds 15 --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 --unhealthy-threshold-count 2 --matcher HttpCode=200 \
+  --query "TargetGroups[0].TargetGroupArn" --output text)
+echo "目標群組：$TG_ARN"
+
+# 把 wp-web-1 加進目標群組
+IID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=wp-web-1" "Name=instance-state-name,Values=running" \
+  --query "Reservations[0].Instances[0].InstanceId" --output text)
+aws elbv2 register-targets --target-group-arn $TG_ARN --targets Id=$IID,Port=80
+echo "✅ 已加入主機 $IID"
+```
+
+✅ **驗證②**（CloudShell）：
+
+```bash
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+aws elbv2 describe-target-groups --names wp-tg \
+  --query "TargetGroups[0].{Name:TargetGroupName, Port:Port, Path:HealthCheckPath, Interval:HealthCheckIntervalSeconds, Healthy:HealthyThresholdCount}" \
+  --output table
+aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State, TargetHealth.Reason]" --output table
+```
+
+正確結果：
+- 第一個表格：**Path** 是 `/healthz`、**Port** 是 `80`、**Interval** 是 `15`、**Healthy** 是 `2`。
+- 第二個表格：列出 `wp-web-1` 的主機 ID，**State 是 `unused`**，Reason 是 `Target.NotInUse`。
+
+> ⚠️ **現在顯示 `unused` 是正常的。** 目標群組還沒接到任何 ALB，所以還沒有人去檢查它。做完 ③ 之後，狀態會變成 `initial`（檢查中），大約 30 秒後變成 **`healthy`**。
+
+| 出現的狀況 | 解法 |
+|---|---|
+| Path 是 `/` | 主控台：Target Groups → `wp-tg` → **Health checks** 分頁 → **Edit** → Path 改成 `/healthz` → Save changes |
+| 第二個表格是空的 | 沒有加入主機：Target Groups → `wp-tg` → **Targets** 分頁 → **Register targets** → 勾選 `wp-web-1` → Include as pending below → Register pending targets |
+| 建立時找不到 `wp-web-1` | VPC 選錯了。刪除這個目標群組，重新建立並選 `wp-vpc` |
+| `DuplicateTargetGroupName`（方法 B） | 已經建立過了，直接做驗證 |
+
+#### ③ 建立 ALB `wp-alb`
+
+**為什麼需要**：ALB（Application Load Balancer，應用程式負載平衡器）是網站固定的**單一入口**：
+
+- **分散流量**：把請求平均分給目標群組中所有健康的主機。主機從 1 台變成 2 台時，訪客完全感覺不到。
+- **自動避開故障**：依 ② 的健康檢查，只把流量送給健康的主機。
+- **跨機房**：ALB 同時存在於兩個 AZ。一個機房故障時，另一個繼續服務。這也是 ALB **至少要選兩個子網路**的原因，1.1 才會建立兩個 public 子網路。
+- **固定網址**：ALB 有一個固定的 DNS 名稱。主機換來換去，網址都不會變。2.4 的 CloudFront 會連到這個網址。
+
+```
+               ┌─────────────── wp-alb（Internet-facing）───────────────┐
+訪客 ─HTTP 80─►│  public1（1a）               public2（1c）               │
+               │  監聽器 HTTP:80 ──► 轉發到目標群組 wp-tg                │
+               └──────────────────────────┬──────────────────────────────┘
+                                          ▼
+                                      wp-web-1（之後還有 ASG 的主機）
+```
+
+> 名詞：
+> - **Internet-facing**：ALB 有公開的網址，網際網路上的人連得到。另一種 *Internal* 只有 VPC 內部連得到。
+> - **Listener（監聽器）**：ALB 在哪個 Port 接收請求，以及收到後要做什麼。這裡是「在 HTTP 80 接收，然後轉發給 `wp-tg`」。
+
+> 💰 **費用提醒**：ALB **建立後就開始計費**，不管有沒有流量。東京區域約每小時 $0.0243，加上用量費，每月約 $20–25。練習完請照「清除所有資源」刪除。
+
+下面兩種方法**擇一**即可。
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **EC2** → 左側 **Load Balancing → Load Balancers** → 右上 **Create load balancer**。
+2. 在 **Application Load Balancer** 那張卡片上按 **Create**（⚠️ 不要選 Network Load Balancer 或 Gateway Load Balancer）。
+
+**Basic configuration（基本設定）**
+
+| 欄位 | 設定 |
+|---|---|
+| **Load balancer name** | `wp-alb` |
+| **Scheme** | **Internet-facing** |
+| **Load balancer IP address type** | **IPv4** |
+
+**Network mapping（網路配置）**
+
+1. **VPC**：⚠️ 改成 **`wp-vpc`**。
+2. **Availability Zones and subnets**：勾選兩個 AZ，並各自選擇 **public** 子網路：
+
+| 勾選 | Subnet |
+|---|---|
+| ✅ `ap-northeast-1a` | **`wp-subnet-public1-ap-northeast-1a`** |
+| ✅ `ap-northeast-1c` | **`wp-subnet-public2-ap-northeast-1c`** |
+
+   ⚠️ 一定要選 **public** 子網路。選到 private 子網路時，ALB 沒有通往網際網路的路由，外面連不進來（主控台通常也會顯示警告）。
+
+**Security groups（安全群組）**
+
+1. 按 `default` 旁邊的 **X** 移除它。
+2. 從下拉選單選 **`wp-alb-sg`**（① 建立的那個）。
+
+**Listeners and routing（監聽器與轉發）**
+
+| 欄位 | 設定 |
+|---|---|
+| **Protocol** | **HTTP** |
+| **Port** | `80` |
+| **Default action** | **Forward to target groups** → 選 **`wp-tg`** |
+
+**其他區塊**（Load balancer tags、Optimize with service integrations 中的 CloudFront／WAF／Global Accelerator 等）：**全部保持預設，不要勾選**。CloudFront 會在 2.4 另外建立。
+
+3. 拉到最下面看 **Summary**，確認 VPC、兩個 public 子網路、`wp-alb-sg`、HTTP:80 → `wp-tg` 都正確 → 按 **Create load balancer**。
+4. 按 **View load balancer**，`wp-alb` 的 **State** 一開始是 *Provisioning*，大約 **3–5 分鐘**後變成 **Active**。
+5. 點 `wp-alb`，在 **Details** 中複製 **DNS name**（類似 `wp-alb-1234567890.ap-northeast-1.elb.amazonaws.com`），填進「準備 5：數值記錄表」。
+
+**方法 B：CloudShell 指令**
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID "Name=tag:Name,Values=wp-subnet-public*" \
+  --query "Subnets[].SubnetId" --output text)
+ALB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-alb-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+echo "public 子網路：$SUBNETS"
+echo "安全群組：$ALB_SG"
+
+# 建立 ALB
+ALB_ARN=$(aws elbv2 create-load-balancer --name wp-alb --type application --scheme internet-facing \
+  --ip-address-type ipv4 --subnets $SUBNETS --security-groups $ALB_SG \
+  --query "LoadBalancers[0].LoadBalancerArn" --output text)
+
+# 建立監聽器：HTTP 80 → 轉發到 wp-tg
+aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 80 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN --query "Listeners[0].ListenerArn" --output text
+
+# 等 ALB 變成 Active（約 3–5 分鐘，等待期間畫面不會有輸出）
+aws elbv2 wait load-balancer-available --load-balancer-arns $ALB_ARN && echo "✅ wp-alb 已是 Active"
+aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].DNSName" --output text
+```
+
+- 「public 子網路」那一行必須印出**兩個** `subnet-` ID。
+- 最後一行印出的就是 ALB 的 DNS name。
+
+✅ **驗證③**（CloudShell）：等 ALB 變成 Active 後，整段貼上：
+
+```bash
+ALB_ARN=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].LoadBalancerArn" --output text)
+ALB_DNS=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].DNSName" --output text)
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+echo "ALB 網址：$ALB_DNS"
+
+STATE=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].State.Code" --output text)
+[ "$STATE" = "active" ] && echo "✅ ALB 狀態：active" || echo "❌ ALB 狀態：$STATE（provisioning 請再等幾分鐘）"
+
+SCHEME=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].Scheme" --output text)
+[ "$SCHEME" = "internet-facing" ] && echo "✅ Scheme：internet-facing" || echo "❌ Scheme：$SCHEME（必須是 internet-facing，需刪除重建）"
+
+for S in $(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].AvailabilityZones[].SubnetId" --output text); do
+  N=$(aws ec2 describe-subnets --subnet-ids $S --query "Subnets[0].Tags[?Key=='Name'].Value | [0]" --output text)
+  case "$N" in *public*) echo "✅ 子網路：$N";; *) echo "❌ 子網路：$N（必須是 public 子網路）";; esac
+done
+
+SGN=$(aws ec2 describe-security-groups --group-ids $(aws elbv2 describe-load-balancers --names wp-alb \
+  --query "LoadBalancers[0].SecurityGroups[0]" --output text) --query "SecurityGroups[0].GroupName" --output text)
+[ "$SGN" = "wp-alb-sg" ] && echo "✅ 安全群組：wp-alb-sg" || echo "❌ 安全群組：$SGN"
+
+FWD=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN \
+  --query "Listeners[?Port==\`80\`].DefaultActions[0].TargetGroupArn | [0]" --output text)
+[ "$FWD" = "$TG_ARN" ] && echo "✅ 監聽器 HTTP:80 轉發到 wp-tg" || echo "❌ 監聽器沒有轉發到 wp-tg"
+
+aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State, TargetHealth.Reason]" --output table
+
+echo "--- 透過 ALB 測試 ---"
+curl -s -m 10 "http://$ALB_DNS/healthz"; echo
+curl -s -m 10 -o /dev/null -w "首頁 HTTP 狀態碼：%{http_code}，轉址到：%{redirect_url}\n" "http://$ALB_DNS/"
+```
+
+正確結果類似：
+
+```text
+ALB 網址：wp-alb-1234567890.ap-northeast-1.elb.amazonaws.com
+✅ ALB 狀態：active
+✅ Scheme：internet-facing
+✅ 子網路：wp-subnet-public1-ap-northeast-1a
+✅ 子網路：wp-subnet-public2-ap-northeast-1c
+✅ 安全群組：wp-alb-sg
+✅ 監聽器 HTTP:80 轉發到 wp-tg
+-----------------------------------------
+|         DescribeTargetHealth          |
++----------------------+----------+-----+
+|  i-0abc123def4567890 |  healthy |  None|
++----------------------+----------+-----+
+--- 透過 ALB 測試 ---
+ok
+首頁 HTTP 狀態碼：301，轉址到：http://13.192.60.150/
+```
+
+- 目標狀態是 **`healthy`**，`/healthz` 回應 **`ok`**，就代表 ALB 已經能把流量送到主機了。
+- 首頁回應 **301 或 302**，而且轉址到你的 EIP 是**正常的**：WordPress 記得的網址還是 `http://<EIP>`，所以會把訪客導回去。2.5 換成 CloudFront 網址後就會解決。
+- 剛建立時目標可能是 `initial`（Reason：`Elb.InitialHealthChecking`），這是正在進行第一次健康檢查。等 30 秒到 1 分鐘再跑一次。
+- 剛變成 Active 時，ALB 的網址可能要再過 1–2 分鐘才查得到。如果 curl 沒有反應，稍等再試。
+
+**目標一直不是 healthy 時：**
+
+| State／Reason | 意思 | 解法 |
+|---|---|---|
+| `unhealthy`／`Target.Timeout` | ALB 連不到主機的 Port 80 | 檢查 `wp-web-sg` 的 inbound：目前（④ 之前）要允許 HTTP 80；做完 ④ 之後，來源要是 `wp-alb-sg` |
+| `unhealthy`／`Target.ResponseCodeMismatch` | 主機有回應，但不是 200 | 健康檢查 Path 不是 `/healthz`，回到 ② 修改；或在主機上執行 `curl -s localhost/healthz` 確認回應 `ok` |
+| `unhealthy`／`Target.FailedHealthChecks` | 主機沒有正常回應 | Session Manager 執行 `systemctl is-active nginx`，必須是 `active` |
+| `unused`／`Target.NotInUse` | 目標群組沒有接到 ALB，或主機所在的 AZ 不在 ALB 的子網路中 | 確認監聽器轉發到 `wp-tg`；確認 ALB 有勾選 `ap-northeast-1a` |
+| `draining` | 主機正在被移出目標群組 | 如果不是你主動移除的，重新註冊主機 |
 
 **④ 收緊主機防火牆**：編輯 `wp-web-sg` 的 inbound，把 HTTP 來源從 `0.0.0.0/0` 改成 **`wp-alb-sg`**。從此主機只接受 ALB 送來的流量。
 
@@ -3266,6 +3527,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.3 ②③（10/27 補充） | 目標群組和 ALB 只有簡短說明 | 改成逐欄位設定表（含 Advanced health check）、CLI 做法、驗證腳本與 unhealthy 排錯表；說明 `unused` 狀態和首頁 301 轉址是正常的 |
 | 2.3 ①（10/27 補充） | ALB 安全群組只有一行說明 | 改成和 `wp-efs-sg` 相同的格式：用途與兩階段示意圖、主控台／CLI 兩種做法、驗證與排錯表 |
 | 2.2（10/27 補充） | 建立 EFS 安全群組與 EFS 的步驟太簡略，搬移指令沒有解釋（3-3～3-6 再加強：逐行解釋、正確畫面、每步完成後的狀態） | 改寫成 4 個步驟：安全群組（主控台／CLI）、EFS 逐欄位設定、逐段解釋的搬移指令、一鍵驗證；加上排錯表與還原方法 |
 | 2.1 驗證 3（10/27 補充） | 依賴前面設定的變數，CloudShell 重新連線後出現 `NoSuchBucket` | 改成可單獨執行並自動判斷 ✅／❌，新增區域與加密檢查、正確輸出範例和每項 ❌ 的修正方法 |
