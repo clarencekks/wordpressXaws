@@ -1376,7 +1376,12 @@ aws iam put-role-policy --role-name wp-ec2-role --policy-name wp-ec2-least-privi
 3. **General configuration**：
    - **AWS Region**：Asia Pacific (Tokyo) ap-northeast-1
    - **Bucket type**：**General purpose**
+   - **Bucket namespace**：選 **Global namespace**（⚠️ 不要選畫面標示 recommended 的 *Account Regional namespace*，原因見下方說明）
    - **Bucket name**：`wp-backup-` 加上你的 12 位數帳號 ID，例如 `wp-backup-123456789012`（全部小寫、不要有空格）
+
+   > **為什麼這裡選 Global namespace？** 選 *Account Regional namespace* 的話，主控台會自動在名稱後面加上 `-帳號ID-ap-northeast-1-an`，實際名稱會變成類似 `wp-backup-123456789012-ap-northeast-1-an`。這樣就和 1.5 IAM 政策裡寫的 `wp-backup-帳號ID` 對不上，主機上傳備份時會出現 `403 Forbidden`，本指南後面的指令也都會找不到這個桶。Account Regional namespace 的好處是名稱不會被別的帳號搶走，但我們的名稱已經包含帳號 ID，本來就不容易撞名，所以選 Global 比較單純。
+   >
+   > 已經用 Account Regional namespace 建好了？桶還是空的，直接刪除重建最簡單：S3 → 勾選那個桶 → **Delete** → 輸入桶名稱確認 → 再照這一步用 Global namespace 重新建立。
 4. **Object Ownership**：保持 **ACLs disabled (recommended)**。
 5. **Block Public Access settings for this bucket**：保持 **Block all public access** 勾選（⚠️ 不要取消，備份檔絕對不能公開）。
 6. **Bucket Versioning**：保持 **Disable**（開啟會保留每個舊版本，多佔空間）。
@@ -2670,6 +2675,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.1 命名空間（10/27 補充） | 新版 S3 主控台多了 Bucket namespace 選項，預設推薦的 Account Regional 會自動加上名稱後綴，造成 IAM 政策不符 | 指定選 Global namespace，說明原因與選錯時的處理 |
 | 2.1（10/27 補充） | 建立步驟簡略；生命週期規則套用到整個桶，會刪掉 Lambda 程式；排程用 UTC 時間（台灣上午 11 點才備份） | 改寫成 5 個步驟（主控台與 CLI 兩種做法）；規則只套用 `db/`；排程改為台灣時間 03:00；加上權限測試、備份內容與桶設定的驗證、還原方法 |
 | Phase 1 檢查表（10/26 補充） | 只有清單，沒有說明怎麼檢查 | 新增 CloudShell 一鍵檢查（自動判斷 ✅／❌）、逐項的主控台位置與修正方法，以及收回 RDS 管理員密碼權限的指令 |
 | 1.13（10/26 補充） | 步驟太簡略；v3 的 Nginx 設定不會把 404 寫進錯誤日誌，原本叫你去 nginx-error 找會找不到 | 改用好認的測試網址並指向 nginx-access；逐步說明 Log group／Log stream 的位置與搜尋方法，加上 CLI 確認與排錯表 |
