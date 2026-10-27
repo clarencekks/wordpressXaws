@@ -1350,31 +1350,124 @@ aws iam put-role-policy --role-name wp-ec2-role --policy-name wp-ec2-least-privi
 
 ### 2.1 建立 S3 備份桶並做第一次資料庫備份
 
-1. **S3 → Create bucket**：
-   - Bucket name：`wp-backup-<ACCOUNT_ID>`（名稱全球唯一，加帳號 ID 最不會撞名）
-   - Region：東京
-   - **Block all public access：保持勾選**
-   - **Create bucket**
-2. 進入該 bucket → **Management → Create lifecycle rule**：名稱 `expire-30d`、Apply to all objects（勾選確認）、勾 **Expire current versions of objects**、天數 `30` → 建立。（舊備份 30 天後自動刪除。）
-3. 主機寫入備份的權限已經在 1.5 的 `wp-ec2-least-privilege` 政策中加好了（`s3:PutObject`／`GetObject`），**bucket 名稱必須是 `wp-backup-你的帳號ID`**，政策才會對得上；取別的名字會出現 `403 Forbidden`。
+**目的**：建立一個 S3「備份桶（bucket）」，每天把 WordPress 資料庫匯出成一個檔案存進去，舊備份 30 天後自動刪除。Phase 3 的 Lambda 程式也會放在同一個桶裡。
 
-4. 在 Session Manager（root）做第一次備份：
+```
+主機上的 wp db export（匯出資料庫）──► 壓縮成 .sql.gz ──► 上傳到 S3：wp-backup-帳號ID/db/
+                                                    └─ 30 天後自動刪除（生命週期規則）
+```
+
+> 名詞：**Bucket（桶）**是 S3 存放檔案的最上層容器，名稱在全世界所有 AWS 帳號中必須是唯一的。**Prefix（前綴）**就像桶裡的資料夾，例如 `db/`。
+
+> ⚠️ **桶的名稱必須是 `wp-backup-你的12位數帳號ID`**，例如 `wp-backup-123456789012`。1.5 給主機的 S3 權限只允許這個名稱，取別的名字，上傳時會出現 `403 Forbidden`。
+
+**開始前確認**：
+- Phase 1 完成檢查表的 1～6 項都是 ✅。
+- 知道你的帳號 ID：主控台右上角點帳號名稱，**Account ID** 那一串 12 位數字（複製時去掉中間的 `-`）；或在 CloudShell 執行 `aws sts get-caller-identity --query Account --output text`。
+
+#### 步驟 1：建立備份桶
+
+下面兩種方法**擇一**即可。方法 B 比較快，也不會打錯名稱。
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **S3**，確認右上角區域是 **東京（ap-northeast-1）**。
+2. 左側 **General purpose buckets** → 右上 **Create bucket**。
+3. **General configuration**：
+   - **AWS Region**：Asia Pacific (Tokyo) ap-northeast-1
+   - **Bucket type**：**General purpose**
+   - **Bucket name**：`wp-backup-` 加上你的 12 位數帳號 ID，例如 `wp-backup-123456789012`（全部小寫、不要有空格）
+4. **Object Ownership**：保持 **ACLs disabled (recommended)**。
+5. **Block Public Access settings for this bucket**：保持 **Block all public access** 勾選（⚠️ 不要取消，備份檔絕對不能公開）。
+6. **Bucket Versioning**：保持 **Disable**（開啟會保留每個舊版本，多佔空間）。
+7. **Default encryption**：保持 **Server-side encryption with Amazon S3 managed keys (SSE-S3)**（免費的自動加密）。
+8. 拉到最下面按 **Create bucket**。出現綠色的 *Successfully created bucket* 就完成了。
+
+**方法 B：CloudShell 指令**
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET=wp-backup-$ACCOUNT_ID
+aws s3api create-bucket --bucket $BUCKET --region ap-northeast-1 \
+  --create-bucket-configuration LocationConstraint=ap-northeast-1
+aws s3api put-public-access-block --bucket $BUCKET --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+echo "✅ 已建立：$BUCKET"
+```
+
+- 出現 `BucketAlreadyOwnedByYou`：這個桶你之前已經建立過了（例如做附錄 A 時），可以直接往下做。
+- 出現 `BucketAlreadyExists`：名稱被別人用走了，通常是帳號 ID 打錯，請確認名稱。
+
+#### 步驟 2：設定「30 天自動刪除舊備份」（生命週期規則）
+
+這條規則**只套用在 `db/` 資料夾**，桶裡的其他檔案（例如 Phase 3 的 Lambda 程式）不受影響。
+
+**方法 A：主控台**
+
+1. S3 → 點進 `wp-backup-帳號ID` → 上方分頁 **Management** → **Lifecycle rules** 區塊按 **Create lifecycle rule**。
+2. **Lifecycle rule name**：`expire-db-30d`
+3. **Choose a rule scope**：選 **Limit the scope of this rule using one or more filters**。
+4. **Filter type → Prefix**：輸入 `db/`（⚠️ 結尾的斜線要打）。
+5. **Lifecycle rule actions**：只勾 **Expire current versions of objects**。
+6. 下方出現 **Days after object creation**：輸入 `30`。
+7. 按右下 **Create rule**。
+
+**方法 B：CloudShell 指令**
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws s3api put-bucket-lifecycle-configuration --bucket wp-backup-$ACCOUNT_ID \
+  --lifecycle-configuration '{"Rules":[{"ID":"expire-db-30d","Status":"Enabled","Filter":{"Prefix":"db/"},"Expiration":{"Days":30}}]}'
+echo "✅ 已設定生命週期規則"
+```
+
+#### 步驟 3：確認主機有寫入權限
+
+主機的權限在 1.5 已經設定好（`wp-ec2-least-privilege` 中的 `BackupBucketObjects`、`BackupBucketList`），**不需要再做任何設定**。這一步只是先確認一下，避免下一步上傳失敗。
+
+在 **Session Manager（root）** 執行：
 
 ```bash
 export AWS_DEFAULT_REGION=ap-northeast-1
-BUCKET=wp-backup-$(aws sts get-caller-identity --query Account --output text)   # 自動帶入帳號 ID
+BUCKET=wp-backup-$(aws sts get-caller-identity --query Account --output text)
+echo "test" | aws s3 cp - s3://$BUCKET/db/permission-test.txt && echo "✅ 主機可以寫入 $BUCKET"
+```
+
+- 出現 `✅ 主機可以寫入 wp-backup-...`：權限正確（這個 4 bytes 的測試檔 30 天後會自動刪除，也可以手動刪掉）。
+- 出現 `AccessDenied` 或 `403 Forbidden`：桶名稱不對，或 1.5 的政策沒有加上。用 `aws s3 ls | grep wp-backup` 確認桶名稱，再重跑 1.5 的指令。
+- 出現 `NoSuchBucket`：步驟 1 沒有建立成功，或建在其他區域。
+
+#### 步驟 4：做第一次手動備份
+
+繼續在 **Session Manager（root）**，一行一行執行：
+
+```bash
+export AWS_DEFAULT_REGION=ap-northeast-1
+BUCKET=wp-backup-$(aws sts get-caller-identity --query Account --output text)
 FILE=/tmp/wp-$(date +%F-%H%M).sql
 sudo -u apache wp --path=/var/www/html db export "$FILE"
 gzip "$FILE" && aws s3 cp "$FILE.gz" "s3://$BUCKET/db/" && rm -f "$FILE.gz"
 ```
 
-5. 設定每天凌晨 3 點自動備份：
+正確畫面類似：
+
+```text
+Success: Exported to '/tmp/wp-2026-10-27-1503.sql'.
+upload: ../../tmp/wp-2026-10-27-1503.sql.gz to s3://wp-backup-123456789012/db/wp-2026-10-27-1503.sql.gz
+```
+
+> 如果 `wp db export` 出現 `caching_sha2_password` 相關錯誤，請看 1.10 的說明，安裝 `mariadb-connector-c` 後再試一次。
+
+#### 步驟 5：設定每天自動備份
+
+繼續在 **Session Manager（root）**。這一段會做四件事：記下桶名稱、建立備份腳本、安裝排程工具（cron）、設定每天**台灣時間凌晨 3 點**執行：
 
 ```bash
-# 把 bucket 名稱存成設定檔（自動帶入帳號 ID）
+# 1) 把桶名稱存成設定檔（自動帶入帳號 ID）
 echo "wp-backup-$(aws sts get-caller-identity --query Account --output text)" > /etc/wp-backup-bucket
 cat /etc/wp-backup-bucket
 
+# 2) 建立備份腳本
 cat > /usr/local/bin/wp-backup.sh <<'EOF'
 #!/bin/bash
 set -e
@@ -1385,18 +1478,68 @@ sudo -u apache wp --path=/var/www/html db export "$FILE" --quiet
 gzip -f "$FILE" && aws s3 cp "$FILE.gz" "s3://$BUCKET/db/" --quiet && rm -f "$FILE.gz"
 EOF
 chmod +x /usr/local/bin/wp-backup.sh
-dnf install -y cronie && systemctl enable --now crond
-echo "0 3 * * * root /usr/local/bin/wp-backup.sh" > /etc/cron.d/wp-backup
 
-# 立刻手動跑一次，確認腳本可用
+# 3) 安裝並啟動 cron（Amazon Linux 2023 預設沒有安裝）
+dnf install -y cronie && systemctl enable --now crond
+
+# 4) 每天台灣時間 03:00 執行（主機時鐘是 UTC，用 CRON_TZ 指定台北時區）
+printf 'CRON_TZ=Asia/Taipei\n0 3 * * * root /usr/local/bin/wp-backup.sh\n' > /etc/cron.d/wp-backup
+
+# 5) 立刻手動跑一次，確認腳本可用
 /usr/local/bin/wp-backup.sh && echo "BACKUP OK"
 ```
 
+- 最後一行出現 `BACKUP OK` 就代表腳本可以正常備份。
+- `dnf install` 會跑幾十秒，期間畫面有安裝訊息是正常的。
+
 > 之後 Phase 2 做成 AMI 時，這個排程會跟著複製到每台主機。若 ASG 擴充到 2 台，兩台都會備份，檔名含主機名稱所以不會互相覆蓋。
 
-✅ **驗證**：S3 主控台的 `db/` 資料夾裡看到一個 `.sql.gz` 檔案。
+✅ **驗證**：
+
+**1. S3 裡有備份檔**（CloudShell）
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws s3 ls s3://wp-backup-$ACCOUNT_ID/db/ --human-readable
+```
+
+看到至少一個 `.sql.gz` 檔案，大小通常是幾十 KB 到幾 MB（剛安裝的 WordPress 大約 100–300 KB）。主控台做法：S3 → `wp-backup-帳號ID` → 點 `db/` 資料夾。
+
+**2. 備份檔內容是完整的 SQL**（CloudShell，把檔名換成上一步看到的其中一個）
+
+```bash
+aws s3 cp s3://wp-backup-$ACCOUNT_ID/db/<檔名>.sql.gz - | gunzip | head -n 5
+aws s3 cp s3://wp-backup-$ACCOUNT_ID/db/<檔名>.sql.gz - | gunzip | grep -c "CREATE TABLE"
+```
+
+第一行指令印出 `-- MariaDB dump` 或 `-- MySQL dump` 開頭的文字；第二行顯示 `12` 左右（WordPress 預設有 12 個資料表，裝了外掛會更多）。
+
+**3. 桶的設定正確**（CloudShell）
+
+```bash
+aws s3api get-public-access-block --bucket wp-backup-$ACCOUNT_ID \
+  --query "PublicAccessBlockConfiguration" --output table
+aws s3api get-bucket-lifecycle-configuration --bucket wp-backup-$ACCOUNT_ID \
+  --query "Rules[].[ID, Filter.Prefix, Expiration.Days, Status]" --output table
+```
+
+- 第一個表格四項都是 `True`（完全不公開）。
+- 第二個表格顯示 `expire-db-30d | db/ | 30 | Enabled`。
+
+**4. 自動排程已設定**（Session Manager，root）
+
+```bash
+systemctl is-active crond
+cat /etc/cron.d/wp-backup
+```
+
+顯示 `active`，以及 `CRON_TZ=Asia/Taipei` 和 `0 3 * * * root /usr/local/bin/wp-backup.sh` 兩行。隔天早上可以再執行一次驗證 1，應該會多一個以當天日期命名的檔案。
 
 > RDS 本身也會每天自動快照（1.3 設了保留 1 天）；S3 上的 SQL 備份是第二道保險，也方便搬家。
+
+> **想從備份還原？**（練習時不需要做，記得有這個方法就好）在 Session Manager（root）執行：
+> `aws s3 cp s3://$BUCKET/db/<檔名>.sql.gz - | gunzip | sudo -u apache wp --path=/var/www/html db import -`
+> ⚠️ 還原會**覆蓋**目前資料庫的所有內容。
 
 ### 2.2 建立 EFS 共用硬碟並搬移網站檔案
 
@@ -1993,7 +2136,7 @@ aws lambda wait function-active-v2 --function-name wp-ops-agent && echo "Lambda 
 - 若出現 `The role defined for the function cannot be assumed by Lambda`，代表 3.3 剛建立的角色還沒生效，等 10 秒再執行一次 `create-function`。
 - 之後修改程式要重新部署時：重做 3.5 上傳，再執行 `aws lambda update-function-code --function-name wp-ops-agent --s3-bucket wp-backup-$ACCOUNT_ID --s3-key lambda/agent.zip`。
 
-> 2.1 設定的「30 天自動刪除」規則也會刪掉 S3 上的 `agent.zip`。這不影響已經部署好的 Lambda（建立時已複製一份），只是重新部署前要先重新上傳。
+> 2.1 設定的「30 天自動刪除」規則只套用在 `db/` 資料夾，S3 上的 `lambda/agent.zip` 不會被刪除。
 
 ✅ **驗證：第一次手動測試**（CloudShell）：
 
@@ -2527,6 +2670,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.1（10/27 補充） | 建立步驟簡略；生命週期規則套用到整個桶，會刪掉 Lambda 程式；排程用 UTC 時間（台灣上午 11 點才備份） | 改寫成 5 個步驟（主控台與 CLI 兩種做法）；規則只套用 `db/`；排程改為台灣時間 03:00；加上權限測試、備份內容與桶設定的驗證、還原方法 |
 | Phase 1 檢查表（10/26 補充） | 只有清單，沒有說明怎麼檢查 | 新增 CloudShell 一鍵檢查（自動判斷 ✅／❌）、逐項的主控台位置與修正方法，以及收回 RDS 管理員密碼權限的指令 |
 | 1.13（10/26 補充） | 步驟太簡略；v3 的 Nginx 設定不會把 404 寫進錯誤日誌，原本叫你去 nginx-error 找會找不到 | 改用好認的測試網址並指向 nginx-access；逐步說明 Log group／Log stream 的位置與搜尋方法，加上 CLI 確認與排錯表 |
 | 1.12（10/26 補充） | 「Notification：In alarm → 選 wp-alerts」太簡略，看不懂要在哪個畫面設定 | 改寫成 Part A（SNS 主題與 Email 訂閱）＋ Part B（告警精靈 Step 1～4 逐畫面說明），並加上確認訂閱與測試告警通知的方法 |
