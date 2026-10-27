@@ -1502,14 +1502,96 @@ aws s3 ls s3://wp-backup-$ACCOUNT_ID/db/ --human-readable
 
 看到至少一個 `.sql.gz` 檔案，大小通常是幾十 KB 到幾 MB（剛安裝的 WordPress 大約 100–300 KB）。主控台做法：S3 → `wp-backup-帳號ID` → 點 `db/` 資料夾。
 
-**2. 備份檔內容是完整的 SQL**（CloudShell，把檔名換成上一步看到的其中一個）
+**2. 備份檔內容是完整的 SQL**（CloudShell）
+
+**為什麼要檢查**：驗證 1 只證明 S3 裡「有檔案」。檔案也可能是空的或只匯出到一半，例如資料庫連線失敗時，就可能只產生一個很小的檔案。真正需要還原時才發現備份是壞的就太晚了，所以要打開檔案看看內容。
+
+**備份檔是什麼**：`wp db export` 會把整個 WordPress 資料庫轉成一份 **SQL 文字檔**，裡面是一行行「建立資料表（`CREATE TABLE`）」和「寫入資料（`INSERT INTO`）」的指令。只要把這份檔案匯回資料庫，就能完整重建網站內容。為了節省空間，我們用 `gzip` 把它壓縮成 `.sql.gz`。
+
+**檢查方式**：不需要下載到自己電腦。下面的指令會直接從 S3 讀取檔案、在記憶體中解壓縮，只把需要看的部分印在畫面上。
+
+在 **CloudShell** 依序執行。
+
+**步驟 2-1：自動找出最新的一個備份檔**
 
 ```bash
-aws s3 cp s3://wp-backup-$ACCOUNT_ID/db/<檔名>.sql.gz - | gunzip | head -n 5
-aws s3 cp s3://wp-backup-$ACCOUNT_ID/db/<檔名>.sql.gz - | gunzip | grep -c "CREATE TABLE"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET=wp-backup-$ACCOUNT_ID
+LATEST=$(aws s3 ls s3://$BUCKET/db/ | grep '\.sql\.gz$' | sort | tail -n 1 | awk '{print $4}')
+echo "最新的備份檔：$LATEST"
 ```
 
-第一行指令印出 `-- MariaDB dump` 或 `-- MySQL dump` 開頭的文字；第二行顯示 `12` 左右（WordPress 預設有 12 個資料表，裝了外掛會更多）。
+| 指令片段 | 意思 |
+|---|---|
+| `aws s3 ls s3://$BUCKET/db/` | 列出 `db/` 資料夾裡的所有檔案（每行是：日期、時間、大小、檔名） |
+| `grep '\.sql\.gz$'` | 只留下 `.sql.gz` 結尾的備份檔，排除權限測試用的 `permission-test.txt` |
+| `sort \| tail -n 1` | 依日期排序後取最後一個，也就是最新的 |
+| `awk '{print $4}'` | 只取第 4 欄的檔名 |
+
+正確結果：印出一個檔名，例如 `最新的備份檔：wp-2026-10-27-1503.sql.gz`。如果冒號後面是空的，代表 `db/` 裡還沒有備份檔，請回到步驟 4 或 5 重新備份。
+
+**步驟 2-2：看檔案開頭，確認是資料庫匯出檔**
+
+```bash
+aws s3 cp s3://$BUCKET/db/$LATEST - | gunzip | head -n 5
+```
+
+| 指令片段 | 意思 |
+|---|---|
+| `aws s3 cp s3://.../$LATEST -` | 從 S3 讀取檔案。最後的 `-` 代表「不存成檔案，直接輸出到畫面」 |
+| `\| gunzip` | 把 gzip 壓縮的內容解壓縮回文字 |
+| `\| head -n 5` | 只顯示前 5 行 |
+
+正確結果類似（版本號碼可能不同）：
+
+```text
+/*M!999999\- enable the sandbox mode */
+-- MariaDB dump 10.19  Distrib 10.5.x-MariaDB, for Linux (x86_64)
+--
+-- Host: wp-db.xxxxxxxx.ap-northeast-1.rds.amazonaws.com    Database: wordpress
+-- ------------------------------------------------------
+```
+
+重點是看到 **`-- MariaDB dump`**（或 `-- MySQL dump`），以及 **`Database: wordpress`**。
+
+**步驟 2-3：數一數有幾個資料表**
+
+```bash
+aws s3 cp s3://$BUCKET/db/$LATEST - | gunzip | grep -c "CREATE TABLE"
+```
+
+- `grep -c "CREATE TABLE"`：計算檔案中出現幾次「CREATE TABLE」，也就是備份了幾個資料表。
+- 正確結果：**`12`** 左右。剛安裝好的 WordPress 預設有 12 個資料表，裝了外掛之後會更多。
+- 如果是 `0`，代表檔案裡沒有任何資料表，備份是空的。
+
+想看是哪些資料表，可以再執行：
+
+```bash
+aws s3 cp s3://$BUCKET/db/$LATEST - | gunzip | grep "CREATE TABLE"
+```
+
+會列出 `wp_posts`（文章）、`wp_users`（使用者）、`wp_options`（網站設定）等資料表。
+
+**步驟 2-4：看檔案結尾，確認有完整匯出**
+
+```bash
+aws s3 cp s3://$BUCKET/db/$LATEST - | gunzip | tail -n 1
+```
+
+- `tail -n 1`：只顯示最後一行。
+- 正確結果類似：`-- Dump completed on 2026-10-27 15:03:12`
+- **`Dump completed`** 代表匯出有完整跑完。如果最後一行不是這句，表示匯出中途被中斷，檔案不完整。
+
+**判斷結果**
+
+| 檢查 | 正確 | 有問題時 |
+|---|---|---|
+| 2-1 找到檔案 | 印出 `.sql.gz` 檔名 | 回到步驟 4 或 5 重新備份 |
+| 2-2 開頭 | `-- MariaDB dump`、`Database: wordpress` | 出現 `gzip: stdin: not in gzip format`：檔案壞了，重新備份 |
+| 2-3 資料表數量 | 12 個以上 | 是 `0`：資料庫匯出失敗，在 Session Manager 執行 `/usr/local/bin/wp-backup.sh` 看錯誤訊息 |
+| 2-4 結尾 | `-- Dump completed on ...` | 沒有這行：匯出被中斷，重新備份 |
+
+四項都正確，這份備份就可以用來還原。
 
 **3. 桶的設定正確**（CloudShell）
 
@@ -2667,6 +2749,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.1 驗證 2（10/27 補充） | 要手動填檔名，也沒解釋指令 | 自動抓最新備份檔；拆成 4 個小步驟（找檔案、看開頭、數資料表、看結尾），逐段解釋指令並附正確輸出與判斷表 |
 | 2.1 命名空間（10/27 補充） | 新版 S3 主控台多了 Bucket namespace 選項，預設推薦的 Account Regional 會自動加上名稱後綴，造成 IAM 政策不符 | 指定選 Global namespace，說明原因與選錯時的處理 |
 | 2.1（10/27 補充） | 建立步驟簡略；生命週期規則套用到整個桶，會刪掉 Lambda 程式；排程用 UTC 時間（台灣上午 11 點才備份） | 改寫成 5 個步驟（主控台與 CLI 兩種做法）；規則只套用 `db/`；排程改為台灣時間 03:00；加上權限測試、備份內容與桶設定的驗證、還原方法 |
 | Phase 1 檢查表（10/26 補充） | 只有清單，沒有說明怎麼檢查 | 新增 CloudShell 一鍵檢查（自動判斷 ✅／❌）、逐項的主控台位置與修正方法，以及收回 RDS 管理員密碼權限的指令 |
