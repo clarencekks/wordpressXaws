@@ -1687,41 +1687,303 @@ cat /etc/cron.d/wp-backup
 
 ### 2.2 建立 EFS 共用硬碟並搬移網站檔案
 
-1. 先建立 EFS 的安全群組：**VPC → Security groups → Create** → 名稱 `wp-efs-sg`、**VPC 改成 `wp-vpc`**（預設是 default VPC，記得改）、Inbound：Type **NFS**（2049）、Source **Custom → `wp-web-sg`**。
-2. **EFS → Create file system → Customize**：
-   - Name：`wp-efs`；File system type：**Regional**
-   - Automatic backups：可取消（省錢）；Lifecycle management：保持預設
-   - Throughput mode：**Elastic**（預設）
-   - Next → Network：VPC `wp-vpc`；Mount targets 兩個 AZ 都選 **public 子網路**，Security groups 都改成 **只有 `wp-efs-sg`**
-   - Next → Next → **Create**
-3. 記下 File system ID（`fs-xxxxxxxx`）。
-4. 在 Session Manager（root）把網站搬到 EFS（把 `fs-xxxxxxxx` 換成你的）：
+**目的**：Phase 2 之後，網站會由**多台主機**一起服務（2.7 的 Auto Scaling）。如果網站檔案還放在各台主機自己的硬碟上，使用者在 A 主機上傳的圖片，B 主機就看不到。所以要把整個網站目錄 `/var/www/html` 搬到 **EFS（共用網路硬碟）**，讓每台主機看到的檔案都一模一樣。
+
+```
+搬移前：EC2 ── 自己的 EBS 硬碟：/var/www/html
+搬移後：EC2-1 ─┐
+              ├──► EFS（共用）：/var/www/html   ← 所有主機都看到同一份檔案
+       EC2-2 ─┘
+       資料庫仍在 RDS，不受影響
+```
+
+> 名詞：
+> - **EFS（Elastic File System）**：可同時被多台 EC2 掛載的網路硬碟，容量自動增減，用多少付多少。
+> - **NFS**：EFS 使用的網路檔案傳輸方式，固定走 **TCP 2049** 這個 Port。
+> - **Mount target（掛載點）**：EFS 在每個可用區（AZ）的「插座」。主機要透過同一個 AZ 的掛載點連到 EFS，所以兩個 AZ 都要建。
+> - **掛載（mount）**：把網路硬碟接到主機上的某個資料夾，之後讀寫那個資料夾，就是在讀寫 EFS。
+
+> 費用：EFS 依實際用量計費，東京區域約每 GB 每月 $0.36。WordPress 剛安裝大約 100 MB，每月不到 $0.1。
+
+整個 2.2 分成 4 個步驟：① 建立 EFS 專用的安全群組 → ② 建立 EFS → ③ 把網站檔案搬到 EFS → ④ 驗證。
+
+---
+
+#### 步驟 1：建立 EFS 專用的安全群組 `wp-efs-sg`
+
+**為什麼需要**：EFS 也有自己的防火牆。我們要規定**只有 WordPress 主機（掛著 `wp-web-sg` 的主機）**可以用 NFS（Port 2049）連進來，其他任何人都連不到。這和 1.2 的 `wp-db-sg` 是同樣的做法。
+
+```
+wp-web-sg 的主機 ──NFS（TCP 2049）──► wp-efs-sg 的 EFS   ✅ 允許
+其他任何來源      ──────────────────► wp-efs-sg 的 EFS   ❌ 擋下
+```
+
+下面兩種方法**擇一**即可。
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **VPC** → 左側 **Security groups** → 右上 **Create security group**。
+2. **Basic details**：
+   - **Security group name**：`wp-efs-sg`
+   - **Description**：`WordPress EFS`（必填，只能用英文）
+   - **VPC**：⚠️ **點開下拉選單，把預設的 default VPC 改成 `wp-vpc`**（顯示為 `vpc-xxxxxxxx (wp-vpc)`）。一定要先改 VPC，下一步才搜尋得到 `wp-web-sg`。
+3. **Inbound rules** → **Add rule**：
+   - **Type**：下拉選單選 **NFS**（Protocol 和 Port range 會自動帶入 `TCP`、`2049`）
+   - **Source**：選 **Custom**，在旁邊的搜尋框輸入 `wp-web` → 選 `sg-xxxxxxxx (wp-web-sg)`
+   - **Description**（選填）：`NFS from WordPress servers`
+4. **Outbound rules**：保持預設，不用改。
+5. 拉到最下面按 **Create security group**。
+
+**方法 B：CloudShell 指令**
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+WEB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-web-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+EFS_SG=$(aws ec2 create-security-group --group-name wp-efs-sg --description "WordPress EFS" \
+  --vpc-id $VPC_ID --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $EFS_SG --protocol tcp --port 2049 --source-group $WEB_SG
+echo "✅ 已建立 wp-efs-sg：$EFS_SG（允許來自 wp-web-sg $WEB_SG 的 NFS 2049）"
+```
+
+✅ **驗證步驟 1**（CloudShell）：
+
+```bash
+aws ec2 describe-security-groups --filters Name=group-name,Values=wp-efs-sg \
+  --query "SecurityGroups[0].{Name:GroupName, VPC:VpcId, Port:IpPermissions[0].FromPort, Source:IpPermissions[0].UserIdGroupPairs[0].GroupId}" \
+  --output table
+aws ec2 describe-security-groups --filters Name=group-name,Values=wp-web-sg --query "SecurityGroups[0].GroupId" --output text
+```
+
+正確結果：
+- 表格中 **Port** 是 `2049`。
+- **VPC** 和 `wp-vpc` 的 ID 相同。
+- **Source** 和第二行印出的 `wp-web-sg` ID 相同。
+
+---
+
+#### 步驟 2：建立 EFS 檔案系統 `wp-efs`
+
+1. 主控台上方搜尋 **EFS**，確認右上角區域是東京。
+2. 按 **Create file system**，在跳出的小視窗中按左下角 **Customize**（⚠️ 不要直接按 Create，那樣會建在 default VPC，安全群組也不對）。
+
+**Step 1：File system settings（一般設定）**
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Name** | `wp-efs` | |
+| **File system type** | **Regional** | 資料同時存放在多個 AZ，一個機房故障也不會遺失 |
+| **Automatic backups** | 取消勾選 | 練習用可省錢；網站資料庫已經有 2.1 的備份 |
+| **Lifecycle management** | 保持預設 | 很久沒讀取的檔案會自動移到較便宜的儲存層 |
+| **Encryption** | 保持勾選 **Enable encryption of data at rest** | 免費的靜態加密 |
+| **Throughput mode** | **Elastic**（預設） | 依實際用量自動調整速度 |
+| **Performance mode** | **General Purpose**（預設） | |
+
+按 **Next**。
+
+**Step 2：Network access（網路設定）**
+
+1. **Virtual Private Cloud (VPC)**：⚠️ 改成 **`wp-vpc`**（預設是 default VPC）。
+2. 下方 **Mount targets** 會出現兩列，每個 AZ 一列，逐列設定：
+
+| Availability zone | Subnet ID | Security groups |
+|---|---|---|
+| `ap-northeast-1a` | 選 **`wp-subnet-public1-ap-northeast-1a`** | 按 **X** 移除 `default`，再選 **`wp-efs-sg`** |
+| `ap-northeast-1c` | 選 **`wp-subnet-public2-ap-northeast-1c`** | 按 **X** 移除 `default`，再選 **`wp-efs-sg`** |
+
+   - **IP address** 保持 Automatic。
+   - 為什麼選 public 子網路？因為 WordPress 主機都在 public 子網路，掛載點放在相同的子網路最單純。EFS 本身**不會**因此對外公開，它沒有公有 IP，而且只有 `wp-efs-sg` 允許的主機連得到。
+3. 按 **Next**。
+
+**Step 3：File system policy（選用）**：全部保持空白，按 **Next**。
+
+**Step 4：Review and create**：檢查 VPC 是 `wp-vpc`、兩個掛載點的安全群組都是 `wp-efs-sg` → 按 **Create**。
+
+建立後回到 EFS 列表：
+- 記下 **File system ID**（`fs-` 開頭，例如 `fs-0123456789abcdef0`），填進「準備 5：數值記錄表」。
+- 點進 `wp-efs` → **Network** 分頁，等兩個掛載點的 **Mount target state** 都從 *Creating* 變成 **Available**，大約 **2–5 分鐘**。⚠️ 還沒變成 Available 之前，步驟 3 的掛載會失敗。
+
+✅ **驗證步驟 2**（CloudShell）：
+
+```bash
+EFS_ID=$(aws efs describe-file-systems --query "FileSystems[?Name=='wp-efs'].FileSystemId | [0]" --output text)
+echo "EFS ID：$EFS_ID"
+for MT in $(aws efs describe-mount-targets --file-system-id $EFS_ID --query "MountTargets[].MountTargetId" --output text); do
+  STATE=$(aws efs describe-mount-targets --mount-target-id $MT --query "MountTargets[0].[AvailabilityZoneName, LifeCycleState]" --output text)
+  SG=$(aws efs describe-mount-target-security-groups --mount-target-id $MT --query "SecurityGroups[0]" --output text)
+  SGNAME=$(aws ec2 describe-security-groups --group-ids $SG --query "SecurityGroups[0].GroupName" --output text)
+  echo "掛載點 $MT：$STATE，安全群組 $SGNAME"
+done
+```
+
+正確結果類似：
+
+```text
+EFS ID：fs-0123456789abcdef0
+掛載點 fsmt-0aaa...：ap-northeast-1a	available，安全群組 wp-efs-sg
+掛載點 fsmt-0bbb...：ap-northeast-1c	available，安全群組 wp-efs-sg
+```
+
+兩個掛載點都要是 `available`，安全群組都要是 `wp-efs-sg`。**記下 EFS ID，步驟 3 要用。**
+
+---
+
+#### 步驟 3：把網站檔案搬到 EFS
+
+**這一步在 Session Manager（root）執行**（提示字元是 `[root@ip-... ~]#`）。
+
+> ⚠️ 搬移過程中，網站會中斷約 **1 分鐘**（步驟 3-4 到 3-6 之間）。練習環境沒有影響；正式網站請選離峰時間。
+
+**3-1：設定 EFS ID 並確認工具已安裝**
+
+把 `fs-xxxxxxxx` 換成步驟 2 記下的 EFS ID：
 
 ```bash
 EFS_ID=fs-xxxxxxxx
-
-# 先掛到暫存位置，把檔案複製過去（rsync 不一定有預裝，先安裝）
+echo "要掛載的 EFS：$EFS_ID"
+rpm -q amazon-efs-utils || dnf install -y amazon-efs-utils
 dnf install -y rsync
-mkdir -p /mnt/efs
-mount -t efs -o tls $EFS_ID:/ /mnt/efs
-rsync -a /var/www/html/ /mnt/efs/
-umount /mnt/efs
+```
 
-# 舊目錄改名保留，改用 EFS 當網站目錄，並設定開機自動掛載
+- `amazon-efs-utils`：讓主機可以用 `mount -t efs` 掛載 EFS，並使用 TLS 加密傳輸。1.7 的 User data 已經安裝過，這裡只是確認。
+- `rsync`：複製檔案的工具，會完整保留檔案的擁有者與權限（Amazon Linux 2023 不一定預裝）。
+
+**3-2：先掛到暫存位置，測試連得上**
+
+```bash
+mkdir -p /mnt/efs
+mount -t efs -o tls $EFS_ID:/ /mnt/efs && echo "✅ 掛載成功"
+df -h /mnt/efs
+```
+
+- 正確結果：出現 `✅ 掛載成功`，`df` 的 Filesystem 欄位顯示 `127.0.0.1:/`（使用 TLS 掛載時就會是這個樣子）。
+- 如果指令**卡住超過 1 分鐘**：按 Ctrl+C 取消，然後檢查三件事：
+  1. 步驟 1 的 `wp-efs-sg` 有沒有允許來自 `wp-web-sg` 的 2049。
+  2. 步驟 2 的掛載點是否都已經是 Available。
+  3. EFS ID 有沒有打錯。
+
+**3-3：把網站檔案複製到 EFS**
+
+```bash
+rsync -a /var/www/html/ /mnt/efs/
+echo "原本的檔案數：$(find /var/www/html -type f | wc -l)"
+echo "EFS 上的檔案數：$(find /mnt/efs -type f | wc -l)"
+umount /mnt/efs
+```
+
+- `rsync -a`：完整複製，保留擁有者（`apache`）與權限。**來源路徑結尾的 `/` 要保留**，代表「複製資料夾裡面的內容」，而不是把整個資料夾放進去。
+- 複製約需 **10–60 秒**，期間畫面沒有輸出是正常的。
+- 兩個檔案數**必須相同**（剛安裝的 WordPress 大約 3,000 多個檔案）。數字不同時，請再執行一次 `rsync` 那一行。
+- `umount`：先卸下暫存位置，下一步會把 EFS 正式掛到網站目錄。
+
+**3-4：停止網站服務，把舊目錄改名保留**
+
+```bash
 systemctl stop nginx php-fpm
 mv /var/www/html /var/www/html.local-backup
 mkdir -p /var/www/html
-echo "$EFS_ID:/ /var/www/html efs _netdev,tls,nofail 0 0" >> /etc/fstab   # nofail：EFS 暫時連不上時主機仍可開機，方便除錯
-mount -a
-systemctl start php-fpm nginx
-
-df -h /var/www/html
-curl -s -o /dev/null -w "%{http_code}\n" localhost/
 ```
 
-> `mount -a` 卡住或逾時：通常是 `wp-efs-sg` 沒有允許來自 `wp-web-sg` 的 NFS 2049，或 EFS 的 mount target 還在建立中（狀態要是 Available）。
+- 先停服務，避免搬移中途有人存取到一半的檔案。
+- 舊目錄改名為 `html.local-backup`，**不刪除**。萬一 EFS 有問題，可以馬上切回來（見最後的「還原方法」）。
 
-✅ **驗證**：`df -h` 顯示 `/var/www/html` 來自 `127.0.0.1:/`（EFS 經 TLS 掛載的樣子）；最後一行為 `200`；`http://<EIP>` 網站正常。
+**3-5：設定開機自動掛載，並立刻掛上**
+
+```bash
+echo "$EFS_ID:/ /var/www/html efs _netdev,tls,nofail 0 0" >> /etc/fstab
+tail -n 1 /etc/fstab
+mount -a
+```
+
+- `/etc/fstab` 是主機的「開機自動掛載清單」。加上這一行，主機每次開機都會自動把 EFS 掛到 `/var/www/html`。之後 2.6 製作的 AMI 也會帶著這個設定，ASG 新開的主機就能自動掛上。
+- 參數說明：`_netdev` 等網路就緒後再掛載；`tls` 加密傳輸；`nofail` 是萬一 EFS 暫時連不上，主機仍然可以開機，方便除錯。
+- `tail` 應該顯示剛加的那一行。⚠️ **這一段只能執行一次**，重複執行會在 fstab 中加入重複的行。
+- `mount -a`：依 fstab 立刻掛載。沒有任何輸出就代表成功。
+
+**3-6：重新啟動網站服務**
+
+```bash
+systemctl start php-fpm nginx
+systemctl is-active php-fpm nginx
+```
+
+兩行都顯示 `active` 就完成了。
+
+---
+
+#### 步驟 4：驗證
+
+在 **Session Manager（root）** 貼上整段：
+
+```bash
+echo "=== 1. 網站目錄掛在 EFS 上 ==="
+findmnt -n -o SOURCE,FSTYPE /var/www/html | grep -q "nfs4" \
+  && echo "✅ /var/www/html 已掛載 EFS（$(findmnt -n -o SOURCE,FSTYPE /var/www/html)）" \
+  || echo "❌ /var/www/html 不是 EFS"
+
+echo "=== 2. 開機會自動掛載 ==="
+[ "$(grep -c ' /var/www/html efs ' /etc/fstab)" = "1" ] && echo "✅ /etc/fstab 有一行 EFS 設定" \
+  || echo "❌ /etc/fstab 的 EFS 設定數量：$(grep -c ' /var/www/html efs ' /etc/fstab)（應該剛好 1 行）"
+
+echo "=== 3. 檔案完整 ==="
+A=$(find /var/www/html.local-backup -type f | wc -l); B=$(find /var/www/html -type f | wc -l)
+[ "$A" = "$B" ] && echo "✅ 檔案數一致：$B" || echo "❌ 檔案數不同：原本 $A，EFS $B"
+ls -l /var/www/html/wp-config.php | grep -q "apache apache" && echo "✅ wp-config.php 擁有者為 apache" || echo "❌ wp-config.php 擁有者不對"
+
+echo "=== 4. WordPress 可以寫入 EFS ==="
+sudo -u apache touch /var/www/html/wp-content/efs-write-test && rm -f /var/www/html/wp-content/efs-write-test \
+  && echo "✅ apache 可以寫入" || echo "❌ apache 無法寫入"
+
+echo "=== 5. 網站正常 ==="
+[ "$(curl -s localhost/healthz)" = "ok" ] && echo "✅ /healthz 正常" || echo "❌ /healthz 失敗"
+CODE=$(curl -s -o /dev/null -w "%{http_code}" localhost/wp-login.php)
+[ "$CODE" = "200" ] && echo "✅ WordPress 登入頁回應 200" || echo "❌ WordPress 登入頁回應 $CODE"
+```
+
+正確結果：
+
+```text
+=== 1. 網站目錄掛在 EFS 上 ===
+✅ /var/www/html 已掛載 EFS（127.0.0.1:/ nfs4）
+=== 2. 開機會自動掛載 ===
+✅ /etc/fstab 有一行 EFS 設定
+=== 3. 檔案完整 ===
+✅ 檔案數一致：3xxx
+✅ wp-config.php 擁有者為 apache
+=== 4. WordPress 可以寫入 EFS ===
+✅ apache 可以寫入
+=== 5. 網站正常 ===
+✅ /healthz 正常
+✅ WordPress 登入頁回應 200
+```
+
+最後在**自己電腦的瀏覽器**打開 `http://<EIP>` 和 `http://<EIP>/wp-admin`，網站和後台都應該跟搬移前一樣正常。
+
+（選用）**確認重開機後也會自動掛上**：EC2 → Instances → 勾選 `wp-web-1` → **Instance state → Reboot instance**。等 2–3 分鐘後重新連 Session Manager，再跑一次上面的驗證。
+
+---
+
+#### 出問題時
+
+| 狀況 | 原因 | 解法 |
+|---|---|---|
+| 3-2 的 `mount` 卡住 | 連不到 EFS | 檢查 `wp-efs-sg` 的 2049 規則來源是 `wp-web-sg`；掛載點要是 Available；EFS ID 正確 |
+| `mount: unknown filesystem type 'efs'` | 沒有安裝 `amazon-efs-utils` | `dnf install -y amazon-efs-utils` |
+| 網站顯示 403 或空白 | EFS 上沒有檔案，或擁有者不對 | 檢查驗證第 3 項；擁有者不對時執行 `chown -R apache:apache /var/www/html` |
+| 驗證第 2 項顯示超過 1 行 | 3-5 執行了不只一次 | `nano /etc/fstab` 刪除重複的行（只保留一行），存檔後執行 `mount -a` |
+| 網站變慢 | EFS 是網路硬碟，比本機硬碟慢 | 正常現象。1.7 已安裝的 PHP OPcache 會快取程式，第二次之後的瀏覽就會變快 |
+
+**還原方法**（想放棄 EFS、回到原本的本機目錄）：
+
+```bash
+systemctl stop nginx php-fpm
+umount /var/www/html
+sed -i '\| /var/www/html efs |d' /etc/fstab
+rmdir /var/www/html && mv /var/www/html.local-backup /var/www/html
+systemctl start php-fpm nginx
+```
+
+> 確認 EFS 運作正常一段時間後，`/var/www/html.local-backup` 可以刪除（`rm -rf /var/www/html.local-backup`）。建議等 2.7 的 Auto Scaling 也測試成功之後再刪。
 
 ### 2.3 建立 ALB（負載平衡器）
 
@@ -2814,6 +3076,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.2（10/27 補充） | 建立 EFS 安全群組與 EFS 的步驟太簡略，搬移指令沒有解釋 | 改寫成 4 個步驟：安全群組（主控台／CLI）、EFS 逐欄位設定、逐段解釋的搬移指令、一鍵驗證；加上排錯表與還原方法 |
 | 2.1 驗證 3（10/27 補充） | 依賴前面設定的變數，CloudShell 重新連線後出現 `NoSuchBucket` | 改成可單獨執行並自動判斷 ✅／❌，新增區域與加密檢查、正確輸出範例和每項 ❌ 的修正方法 |
 | 2.1 驗證 2（10/27 補充） | 要手動填檔名，也沒解釋指令 | 自動抓最新備份檔；拆成 4 個小步驟（找檔案、看開頭、數資料表、看結尾），逐段解釋指令並附正確輸出與判斷表 |
 | 2.1 命名空間（10/27 補充） | 新版 S3 主控台多了 Bucket namespace 選項，預設推薦的 Account Regional 會自動加上名稱後綴，造成 IAM 政策不符 | 指定選 Global namespace，說明原因與選錯時的處理 |
