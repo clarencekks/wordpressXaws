@@ -1595,18 +1595,80 @@ aws s3 cp s3://$BUCKET/db/$LATEST - | gunzip | tail -n 1
 
 **3. 桶的設定正確**（CloudShell）
 
+這段可以**單獨執行**，不需要先跑前面的指令：它會自己取得帳號 ID、確認桶存在，再逐項檢查。整段貼上即可：
+
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)   # CloudShell 重新連線後變數會消失，每次都重新取得
-aws s3api get-public-access-block --bucket wp-backup-$ACCOUNT_ID \
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET=wp-backup-$ACCOUNT_ID
+echo "檢查的桶：$BUCKET"
+
+# ① 桶存在，而且在東京區域
+REGION=$(aws s3api get-bucket-location --bucket $BUCKET --query LocationConstraint --output text 2>/dev/null)
+[ "$REGION" = "ap-northeast-1" ] && echo "✅ 桶存在，位於 ap-northeast-1" \
+  || echo "❌ 找不到桶或區域不對（結果：${REGION:-不存在}）。用 aws s3 ls | grep wp-backup 查看實際名稱"
+
+# ② 完全不公開（四項封鎖都要是 True）
+aws s3api get-public-access-block --bucket $BUCKET \
   --query "PublicAccessBlockConfiguration" --output table
-aws s3api get-bucket-lifecycle-configuration --bucket wp-backup-$ACCOUNT_ID \
+PAB=$(aws s3api get-public-access-block --bucket $BUCKET --query \
+  "PublicAccessBlockConfiguration.[BlockPublicAcls,IgnorePublicAcls,BlockPublicPolicy,RestrictPublicBuckets]" --output text 2>/dev/null)
+[ "$(echo $PAB)" = "True True True True" ] && echo "✅ 已封鎖所有公開存取" || echo "❌ 公開存取封鎖不完整：$PAB"
+
+# ③ 30 天自動刪除規則只套用在 db/
+aws s3api get-bucket-lifecycle-configuration --bucket $BUCKET \
   --query "Rules[].[ID, Filter.Prefix, Expiration.Days, Status]" --output table
+RULE=$(aws s3api get-bucket-lifecycle-configuration --bucket $BUCKET \
+  --query "Rules[?Filter.Prefix=='db/' && Status=='Enabled'].Expiration.Days | [0]" --output text 2>/dev/null)
+[ "$RULE" = "30" ] && echo "✅ db/ 的檔案 30 天後自動刪除" || echo "❌ 找不到 db/ 的 30 天規則（結果：${RULE:-無}），請重做步驟 2"
+
+# ④ 預設加密
+ENC=$(aws s3api get-bucket-encryption --bucket $BUCKET \
+  --query "ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm" --output text 2>/dev/null)
+[ -n "$ENC" ] && [ "$ENC" != "None" ] && echo "✅ 預設加密：$ENC" || echo "❌ 沒有預設加密"
 ```
 
-- 第一個表格四項都是 `True`（完全不公開）。
-- 第二個表格顯示 `expire-db-30d | db/ | 30 | Enabled`。
+**每一項在檢查什麼：**
 
-> 出現 `NoSuchBucket`：用 `aws s3 ls | grep wp-backup` 列出實際的桶名稱。名稱和 `wp-backup-你的帳號ID` 不同（例如多了 `-ap-northeast-1-an`），代表建立時選了 Account Regional namespace，請照步驟 1 的說明刪除後重建；什麼都沒列出，代表桶沒有建立成功，請重做步驟 1。
+| 項目 | 檢查內容 | 為什麼重要 |
+|---|---|---|
+| ① | 桶存在，而且在東京區域 | 名稱或區域不對，後面所有指令都會出現 `NoSuchBucket` |
+| ② | 「封鎖公開存取」的四個開關都是 `True` | 備份檔包含整個資料庫，包括使用者帳號和密碼雜湊，絕對不能公開 |
+| ③ | `db/` 資料夾有 30 天自動刪除規則，而且是啟用（Enabled）狀態 | 避免備份無限累積、持續增加儲存費用 |
+| ④ | 有預設加密（`AES256` 就是 SSE-S3） | 檔案在 AWS 硬碟上是加密儲存的 |
+
+**正確結果**（中間會印出兩個表格，最後四行如下）：
+
+```text
+檢查的桶：wp-backup-123456789012
+✅ 桶存在，位於 ap-northeast-1
+✅ 已封鎖所有公開存取
+✅ db/ 的檔案 30 天後自動刪除
+✅ 預設加密：AES256
+```
+
+中間的兩個表格分別長這樣：
+
+```text
+-----------------------------------
+|      GetPublicAccessBlock       |
++-------------------------+-------+
+|  BlockPublicAcls        |  True |
+|  BlockPublicPolicy      |  True |
+|  IgnorePublicAcls       |  True |
+|  RestrictPublicBuckets  |  True |
++-------------------------+-------+
+----------------------------------------
+|    GetBucketLifecycleConfiguration   |
++----------------+------+-----+--------+
+|  expire-db-30d |  db/ |  30 | Enabled|
++----------------+------+-----+--------+
+```
+
+**出現 ❌ 時：**
+- ①：用 `aws s3 ls | grep wp-backup` 列出實際的桶名稱。名稱後面多了 `-ap-northeast-1-an`，代表建立時選了 Account Regional namespace，請照步驟 1 的說明刪除後重建；什麼都沒列出，代表桶沒有建立成功，請重做步驟 1。
+- ②：S3 → 點進桶 → **Permissions** 分頁 → **Block public access (bucket settings)** → **Edit** → 勾選 **Block all public access** → **Save changes**（或執行步驟 1 方法 B 的 `put-public-access-block` 那一行）。
+- ③：重做步驟 2。注意 Prefix 要是 `db/`，結尾有斜線。
+- ④：S3 → 點進桶 → **Properties** 分頁 → **Default encryption** → **Edit** → 選 **SSE-S3** → **Save changes**。
 
 **4. 自動排程已設定**（Session Manager，root）
 
@@ -2752,6 +2814,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.1 驗證 3（10/27 補充） | 依賴前面設定的變數，CloudShell 重新連線後出現 `NoSuchBucket` | 改成可單獨執行並自動判斷 ✅／❌，新增區域與加密檢查、正確輸出範例和每項 ❌ 的修正方法 |
 | 2.1 驗證 2（10/27 補充） | 要手動填檔名，也沒解釋指令 | 自動抓最新備份檔；拆成 4 個小步驟（找檔案、看開頭、數資料表、看結尾），逐段解釋指令並附正確輸出與判斷表 |
 | 2.1 命名空間（10/27 補充） | 新版 S3 主控台多了 Bucket namespace 選項，預設推薦的 Account Regional 會自動加上名稱後綴，造成 IAM 政策不符 | 指定選 Global namespace，說明原因與選錯時的處理 |
 | 2.1（10/27 補充） | 建立步驟簡略；生命週期規則套用到整個桶，會刪掉 Lambda 程式；排程用 UTC 時間（台灣上午 11 點才備份） | 改寫成 5 個步驟（主控台與 CLI 兩種做法）；規則只套用 `db/`；排程改為台灣時間 03:00；加上權限測試、備份內容與桶設定的驗證、還原方法 |
