@@ -2417,6 +2417,7 @@ aws elbv2 describe-target-health --target-group-arn $TG_ARN \
 echo "--- 透過 ALB 測試 ---"
 curl -s -m 10 "http://$ALB_DNS/healthz"; echo
 curl -s -m 10 -o /dev/null -w "首頁 HTTP 狀態碼：%{http_code}，轉址到：%{redirect_url}\n" "http://$ALB_DNS/"
+echo "=== 請把這個 ALB DNS name 記到「準備 5：數值記錄表」：$ALB_DNS ==="
 ```
 
 正確結果類似：
@@ -2437,10 +2438,12 @@ ALB 網址：wp-alb-1234567890.ap-northeast-1.elb.amazonaws.com
 --- 透過 ALB 測試 ---
 ok
 首頁 HTTP 狀態碼：301，轉址到：http://13.192.60.150/
+=== 請把這個 ALB DNS name 記到「準備 5：數值記錄表」：wp-alb-1234567890.ap-northeast-1.elb.amazonaws.com ===
 ```
 
 - 目標狀態是 **`healthy`**，`/healthz` 回應 **`ok`**，就代表 ALB 已經能把流量送到主機了。
-- 首頁回應 **301 或 302**，而且轉址到你的 EIP 是**正常的**：WordPress 記得的網址還是 `http://<EIP>`，所以會把訪客導回去。2.5 換成 CloudFront 網址後就會解決。
+- 首頁回應 **200**，或回應 **301／302** 並轉址到你的 EIP，**兩種都正常**。轉址是因為 WordPress 記得的網址還是 `http://<EIP>`，會把訪客導回去；2.5 換成 CloudFront 網址後就會解決。
+- **ALB 網址（DNS name）印在第一行和最後一行。** 如果畫面捲走了，單獨執行 `echo $ALB_DNS` 再看一次；或到主控台 **EC2 → Load Balancers → 點 `wp-alb`**，在 **Details** 區塊右上方的 **DNS name** 旁按複製圖示。只要 `/healthz` 回應 `ok`，就代表這個變數一定有值（變數是空的話，curl 不會有任何回應）。
 - 剛建立時目標可能是 `initial`（Reason：`Elb.InitialHealthChecking`），這是正在進行第一次健康檢查。等 30 秒到 1 分鐘再跑一次。
 - 剛變成 Active 時，ALB 的網址可能要再過 1–2 分鐘才查得到。如果 curl 沒有反應，稍等再試。
 
@@ -3527,6 +3530,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.3 ③驗證（10/27 實作） | 網址只印在輸出最上方容易被捲走；實際首頁回應 200，不是 301 | 最後一行再印一次 ALB DNS name，並說明主控台哪裡複製；說明首頁 200 或 301 都正常 |
 | 2.3 ②③（10/27 補充） | 目標群組和 ALB 只有簡短說明 | 改成逐欄位設定表（含 Advanced health check）、CLI 做法、驗證腳本與 unhealthy 排錯表；說明 `unused` 狀態和首頁 301 轉址是正常的 |
 | 2.3 ①（10/27 補充） | ALB 安全群組只有一行說明 | 改成和 `wp-efs-sg` 相同的格式：用途與兩階段示意圖、主控台／CLI 兩種做法、驗證與排錯表 |
 | 2.2（10/27 補充） | 建立 EFS 安全群組與 EFS 的步驟太簡略，搬移指令沒有解釋（3-3～3-6 再加強：逐行解釋、正確畫面、每步完成後的狀態） | 改寫成 4 個步驟：安全群組（主控台／CLI）、EFS 逐欄位設定、逐段解釋的搬移指令、一鍵驗證；加上排錯表與還原方法 |
