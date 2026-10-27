@@ -2457,14 +2457,141 @@ ok
 | `unused`／`Target.NotInUse` | 目標群組沒有接到 ALB，或主機所在的 AZ 不在 ALB 的子網路中 | 確認監聽器轉發到 `wp-tg`；確認 ALB 有勾選 `ap-northeast-1a` |
 | `draining` | 主機正在被移出目標群組 | 如果不是你主動移除的，重新註冊主機 |
 
-**④ 收緊主機防火牆**：編輯 `wp-web-sg` 的 inbound，把 HTTP 來源從 `0.0.0.0/0` 改成 **`wp-alb-sg`**。從此主機只接受 ALB 送來的流量。
+#### ④ 收緊主機防火牆：`wp-web-sg` 只允許 ALB 連進來
 
-✅ **驗證**：
-- **Target Groups → wp-tg → Targets**：`wp-web-1` 狀態 **healthy**。
-- 在 CloudShell：`curl -s http://<ALB的DNS>/healthz` 回傳 `ok`。
-- `http://<EIP>` 現在應該**打不開**了（代表防火牆生效）。
+**為什麼需要**：目前 `wp-web-sg` 的 HTTP 80 規則來源是 `0.0.0.0/0`，任何人都可以**繞過 ALB**，直接用 `http://<EIP>` 連到主機。這樣 ALB 的分流、健康檢查，以及 2.5 之後 CloudFront 的保護都會被跳過。把來源改成 **`wp-alb-sg`** 之後，只有 ALB 能把流量送進主機。
 
-> 從這一步到 2.5 完成之前，網站對外暫時無法瀏覽（WordPress 仍記得舊網址 `http://<EIP>`，從 ALB 打開首頁會被導回舊網址）。這是正常的，做完 2.5 就會恢復。
+```
+改之前：  訪客 ──► ALB ──► wp-web-1          ✅
+          訪客 ──────────► wp-web-1（EIP）   ✅ ← 可以繞過 ALB，不安全
+
+改之後：  訪客 ──► ALB（wp-alb-sg）──► wp-web-1   ✅ 來源是 wp-alb-sg，允許
+          訪客 ──────────────────────► wp-web-1   ❌ 被 wp-web-sg 擋下（連線逾時）
+```
+
+> - **來源設成「安全群組」的意思**：只要網路卡上掛著 `wp-alb-sg` 的資源（也就是 ALB）就允許。ALB 的 IP 會變動，用安全群組當來源就不必管 IP。這和 1.2 的 `wp-db-sg`、2.2 的 `wp-efs-sg` 是同樣的做法。
+> - **Session Manager 不受影響**：Session Manager 是主機主動連出去，不需要任何 inbound 規則，所以改完之後照樣登得進去。
+> - **主機連外不受影響**：安全群組只管「進來」，主機的 outbound 沒有改。
+
+**開始前先確認**：③ 的驗證已經通過（`wp-web-1` 是 `healthy`，`/healthz` 回應 `ok`）。
+
+下面兩種方法**擇一**即可。
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **VPC** → 左側 **Security → Security groups**。
+2. 勾選 **`wp-web-sg`**（如果名稱欄是空的，看 **Security group name** 欄）→ 下方點 **Inbound rules** 分頁 → 按 **Edit inbound rules**。
+3. 你會看到一條規則：Type `HTTP`、Port `80`、Source `Custom`、`0.0.0.0/0`。在這一條上修改：
+
+| 欄位 | 改之前 | 改之後 |
+|---|---|---|
+| **Type** | HTTP | HTTP（不動） |
+| **Port range** | 80 | 80（不動） |
+| **Source** | Custom、`0.0.0.0/0` | **Custom**：先按 `0.0.0.0/0` 旁邊的 **X** 刪掉它，再在搜尋框輸入 `wp-alb` → 選 **`sg-xxxxxxxx (wp-alb-sg)`** |
+| **Description** | （空白） | `HTTP from ALB only`（選填，只能用英文） |
+
+   ⚠️ 來源欄裡**只能留下** `wp-alb-sg` 一個。如果 `0.0.0.0/0` 還在，就等於沒改。
+   ⚠️ 如果還有其他規則（例如 Source 是 `::/0` 的 IPv6 HTTP 規則、Port 22、All traffic），按該列最右邊的 **Delete** 刪掉。最後**只剩一條**規則。
+   ⚠️ 搜尋 `wp-alb` 找不到時，代表 `wp-alb-sg` 不在 `wp-vpc` 裡，回到 ① 檢查。
+
+4. 按右下 **Save rules**。畫面上方出現綠色的 *Inbound security group rules successfully modified*，就完成了。改完**立刻生效**，不用重開主機。
+
+**方法 B：CloudShell 指令**
+
+先加新規則、再刪舊規則，中間 ALB 不會中斷：
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+WEB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-web-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+ALB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-alb-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+echo "wp-web-sg：$WEB_SG    wp-alb-sg：$ALB_SG"
+
+# 1. 新增：允許來自 wp-alb-sg 的 HTTP 80
+aws ec2 authorize-security-group-ingress --group-id $WEB_SG \
+  --ip-permissions '[{"IpProtocol":"tcp","FromPort":80,"ToPort":80,"UserIdGroupPairs":[{"GroupId":"'"$ALB_SG"'","Description":"HTTP from ALB only"}]}]' \
+  --query "Return" --output text
+
+# 2. 刪除：所有人都能連的 HTTP 80
+aws ec2 revoke-security-group-ingress --group-id $WEB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0 \
+  --query "Return" --output text
+```
+
+- 兩個 `ID` 都必須是 `sg-` 開頭。如果其中一個是 `None`，代表名稱打錯或不在 `wp-vpc` 裡，先不要往下做。
+- 兩個指令各印出 `True` 就成功了。
+- 如果出現 `InvalidPermission.Duplicate`，代表新規則已經存在；`InvalidPermission.NotFound` 代表舊規則已經刪掉了。兩種都可以直接做驗證。
+
+✅ **驗證④**（CloudShell）：整段貼上：
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+WEB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-web-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+ALB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-alb-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+ALB_DNS=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].DNSName" --output text)
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+EIP=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=wp-web-1" "Name=instance-state-name,Values=running" \
+  --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+
+echo "--- wp-web-sg 的 inbound 規則 ---"
+aws ec2 describe-security-group-rules --filters Name=group-id,Values=$WEB_SG \
+  --query "SecurityGroupRules[?IsEgress==\`false\`].{Port:FromPort, FromCIDR:CidrIpv4, FromIPv6:CidrIpv6, FromSG:ReferencedGroupInfo.GroupId}" \
+  --output table
+N=$(aws ec2 describe-security-group-rules --filters Name=group-id,Values=$WEB_SG \
+  --query "length(SecurityGroupRules[?IsEgress==\`false\`])" --output text)
+SRC=$(aws ec2 describe-security-group-rules --filters Name=group-id,Values=$WEB_SG \
+  --query "SecurityGroupRules[?IsEgress==\`false\`].ReferencedGroupInfo.GroupId | [0]" --output text)
+[ "$N" = "1" ] && [ "$SRC" = "$ALB_SG" ] && echo "✅ 只有一條規則，來源是 wp-alb-sg（$ALB_SG）" \
+  || echo "❌ 規則有 $N 條，或來源不是 wp-alb-sg（目前：$SRC）"
+
+echo "--- 透過 ALB（應該通） ---"
+H=$(curl -s -m 10 "http://$ALB_DNS/healthz")
+[ "$H" = "ok" ] && echo "✅ ALB /healthz：ok" || echo "❌ ALB /healthz 沒有回應 ok（目前：$H）"
+aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State]" --output text
+
+echo "--- 直接連 EIP（應該不通） ---"
+C=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "http://$EIP/healthz")
+[ "$C" = "000" ] && echo "✅ 直接連 http://$EIP 被擋下（逾時），防火牆生效" \
+  || echo "❌ 直接連 http://$EIP 還能連上（HTTP $C），0.0.0.0/0 規則可能還在"
+```
+
+正確結果類似：
+
+```text
+--- wp-web-sg 的 inbound 規則 ---
+--------------------------------------------------------------
+|                 DescribeSecurityGroupRules                 |
++-----------+-----------+-------+------------------------+
+| FromCIDR  | FromIPv6  | Port  |        FromSG          |
++-----------+-----------+-------+------------------------+
+|  None     |  None     |  80   |  sg-0abc1234def567890  |
++-----------+-----------+-------+------------------------+
+✅ 只有一條規則，來源是 wp-alb-sg（sg-0abc1234def567890）
+--- 透過 ALB（應該通） ---
+✅ ALB /healthz：ok
+i-0abc123def4567890	healthy
+--- 直接連 EIP（應該不通） ---
+✅ 直接連 http://13.192.60.150 被擋下（逾時），防火牆生效
+```
+
+- 最後一項會**等 5 秒**才出結果，因為被防火牆擋下的連線不會有回應，要等到逾時。這是正常的。
+- 目標狀態必須還是 **`healthy`**。如果變成 `unhealthy`，代表 ALB 也被擋住了，看下面的排錯表。
+
+> 📌 **之後要用 ALB 網址瀏覽網站。** 從現在起 `http://<EIP>` 打不開了。WordPress 記得的網址還是 `http://<EIP>`，所以從 ALB 打開網站時，部分連結、圖片或登入後台時可能會被導回 EIP 而打不開。這是正常的，2.5 把網址改成 CloudFront 之後就會恢復。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| ❌ 規則有 2 條，其中一條 FromCIDR 是 `0.0.0.0/0` | 舊規則沒刪掉 | 回到方法 A 步驟 3，刪掉 `0.0.0.0/0` 那條，或執行方法 B 的第 2 個指令 |
+| ❌ 有一條 FromIPv6 是 `::/0` | 有 IPv6 的開放規則 | Edit inbound rules → 把那一條 **Delete** → Save rules |
+| 目標變成 `unhealthy`（`Target.Timeout`） | 來源選錯了，ALB 也被擋住 | 確認來源是 **`wp-alb-sg`**，不是 `wp-web-sg` 或 `wp-efs-sg`。ID 要和驗證印出的 `wp-alb-sg` 相同 |
+| 直接連 EIP 還是通 | `0.0.0.0/0` 規則還在 | 同第一列 |
+| Source 搜尋不到 `wp-alb-sg` | `wp-alb-sg` 不在 `wp-vpc` 裡 | 回到 ① 用驗證①檢查 VPC |
+| Session Manager 連不上 | 和這一步無關 | Session Manager 不需要 inbound 規則；檢查主機是否 running、IAM 角色是否還在 |
+
+> 💡 「Phase 1 完成檢查表」第 2 項預期 `wp-web-sg` 的來源是 `0.0.0.0/0`。做完 ④ 之後，正確答案變成 **`wp-alb-sg`**，重跑那份檢查時不用改回去。
 
 ### 2.4 建立 CloudFront（全球加速 + 免費 HTTPS）
 
@@ -3530,6 +3657,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.3 ④（10/27 補充） | 收緊 `wp-web-sg` 只有一行說明 | 改成主控台逐欄位步驟、先加後刪的 CLI 做法、驗證腳本（規則、ALB 通、EIP 不通）與排錯表；修正「做完 ④ 網站就無法瀏覽」的說法 |
 | 2.3 ③驗證（10/27 實作） | 網址只印在輸出最上方容易被捲走；實際首頁回應 200，不是 301 | 最後一行再印一次 ALB DNS name，並說明主控台哪裡複製；說明首頁 200 或 301 都正常 |
 | 2.3 ②③（10/27 補充） | 目標群組和 ALB 只有簡短說明 | 改成逐欄位設定表（含 Advanced health check）、CLI 做法、驗證腳本與 unhealthy 排錯表；說明 `unused` 狀態和首頁 301 轉址是正常的 |
 | 2.3 ①（10/27 補充） | ALB 安全群組只有一行說明 | 改成和 `wp-efs-sg` 相同的格式：用途與兩階段示意圖、主控台／CLI 兩種做法、驗證與排錯表 |
