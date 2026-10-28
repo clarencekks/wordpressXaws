@@ -2116,7 +2116,7 @@ rmdir /var/www/html && mv /var/www/html.local-backup /var/www/html
 systemctl start php-fpm nginx
 ```
 
-> 確認 EFS 運作正常一段時間後，`/var/www/html.local-backup` 可以刪除（`rm -rf /var/www/html.local-backup`）。建議等 2.7 的 Auto Scaling 也測試成功之後再刪。
+> `/var/www/html.local-backup` 先留著，萬一 EFS 有問題可以用上面的方法還原。**2.6-1 製作 AMI 之前會刪除它**，因為它會被打包進 AMI，而且裡面的 `wp-config.php` 含有資料庫密碼。
 
 ### 2.3 建立 ALB（負載平衡器）
 
@@ -3299,22 +3299,328 @@ i-0abc123def4567890	healthy
 
 ### 2.6 製作 AMI 與啟動範本
 
-1. **EC2 → Instances** → 勾選 `wp-web-1` → **Actions → Image and templates → Create image**。
-2. Image name：`wp-web-ami-v1` → **Create image**。到 **AMIs** 等狀態變 **Available**（約 5–10 分鐘）。建立映像檔時主機會**自動重開機一次**，網站會中斷 1–2 分鐘。
-3. **EC2 → Launch Templates → Create launch template**：
-   - Name：`wp-web-lt`；勾選 **Provide guidance to help me set up a template that I can use with EC2 Auto Scaling**
-   - AMI：**My AMIs → `wp-web-ami-v1`**
-   - Instance type：`t3.micro`
-   - Key pair：**Don't include in launch template**
-   - Network settings：Subnet **Don't include in launch template**；外層的 **Firewall (security groups) 不要選**（保持空白）
-   - 展開 **Advanced network configuration → Add network interface**：
-     - **Auto-assign public IP：Enable**（沒有 NAT Gateway，主機要有公有 IP 才能連到 SSM 和下載更新）
-     - **Security groups：`wp-web-sg`**（安全群組要設在網路介面這裡。若外層也選了，建立時會出現 *Network interfaces and an instance-level security groups may not be specified on the same request* 錯誤）
-   - Resource tags：Key `Role`、Value `wordpress`，Resource types 勾 **Instances**；再加一個 Key `Name`、Value `wp-web-asg`
-   - Advanced details：IAM instance profile `wp-ec2-role`；Metadata version **V2 only**
-   - **Create launch template**
+**為什麼需要**：2.7 的 Auto Scaling 會在需要時**自動開新主機**，例如主機故障或流量變大的時候。新主機要一開機就能服務，所以先把 `wp-web-1` 拍成一份「主機快照」（**AMI**），再寫一張「開機設定單」（**啟動範本**）告訴 Auto Scaling 要怎麼開主機。
 
-> AMI 已包含 Nginx、PHP、CloudWatch Agent、備份排程以及 EFS 自動掛載設定，所以新主機開機後就能直接服務。
+```
+wp-web-1 ──拍照──► AMI wp-web-ami-v1 ──┐
+（Nginx、PHP、CloudWatch Agent、         │
+  備份排程、EFS 自動掛載設定）            ▼
+                     啟動範本 wp-web-lt：用哪個 AMI、多大的主機、哪個安全群組、
+                                         哪個 IAM 角色、要不要公有 IP、標籤
+                                          │
+                                          ▼
+                     2.7 Auto Scaling：照這張設定單開新主機 → 自動掛上 EFS → 加入 wp-tg
+```
+
+> 名詞：
+> - **AMI（Amazon Machine Image）**：整台主機硬碟的快照，包含作業系統、安裝好的軟體和設定檔。用它開出來的主機，內容和拍照當時一模一樣。
+> - **Launch template（啟動範本）**：開主機時要填的所有欄位（AMI、主機類型、網路、權限、標籤）存成一份範本，Auto Scaling 每次開主機都照它填。
+>
+> 💡 **網站檔案不在 AMI 裡**：`/var/www/html` 是 EFS，新主機開機時才接上，所以之後上傳的圖片、安裝的外掛，所有主機都看得到，不用重做 AMI。只有**主機本身的設定**（例如更新 PHP、改 Nginx 設定）改變時，才需要做新版 AMI，見 2.6-6。
+
+#### 2.6-1 做 AMI 前的準備（Session Manager，root）
+
+AMI 拍下的是主機**現在的樣子**。主機有問題，之後每一台新主機都會有同樣的問題，所以要先檢查和整理。
+
+Session Manager 登入 `wp-web-1` → `sudo -i`。
+
+**步驟 1：檢查主機狀態**（整段貼上）
+
+```bash
+echo "--- EFS ---"
+findmnt -n -o FSTYPE /var/www/html | grep -q nfs4 && echo "✅ /var/www/html 已掛載 EFS" || echo "❌ /var/www/html 沒有掛載 EFS"
+N=$(grep -c ' /var/www/html efs ' /etc/fstab)
+[ "$N" = "1" ] && echo "✅ /etc/fstab 有一行 EFS 自動掛載設定" || echo "❌ /etc/fstab 的 EFS 設定有 $N 行（應該剛好 1 行，見 2.2 排錯表）"
+[ -f /var/www/html/wp-config.php ] && echo "✅ EFS 上有 wp-config.php" || echo "❌ EFS 上找不到 wp-config.php"
+
+echo "--- 開機自動啟動的服務 ---"
+for s in nginx php-fpm crond amazon-cloudwatch-agent amazon-ssm-agent; do
+  E=$(systemctl is-enabled $s 2>/dev/null); A=$(systemctl is-active $s 2>/dev/null)
+  [ "$E" = "enabled" ] && [ "$A" = "active" ] && echo "✅ $s：開機自動啟動、執行中" || echo "❌ $s：is-enabled=$E、is-active=$A"
+done
+
+echo "--- 其他 ---"
+[ -f /etc/cron.d/wp-backup ] && echo "✅ 每日備份排程存在" || echo "❌ 找不到 /etc/cron.d/wp-backup（回到 2.1 步驟 5）"
+[ "$(curl -s localhost/healthz)" = "ok" ] && echo "✅ /healthz 回應 ok" || echo "❌ /healthz 沒有回應 ok"
+[ -d /var/www/html.local-backup ] && echo "⚠️ /var/www/html.local-backup 還在（步驟 3 會刪除）" || echo "✅ 沒有 /var/www/html.local-backup"
+```
+
+- 每一項都要是 ✅（最後一項是 ⚠️ 也沒關係，步驟 3 會處理）。
+- 某個服務顯示 `is-enabled=disabled`：執行 `systemctl enable --now 服務名稱`（例如 `systemctl enable --now crond`），再跑一次。**沒有設成 enabled 的服務，新主機開機後不會自動啟動。**
+
+**步驟 2：讓健康檢查也檢查 EFS**
+
+目前的 `/healthz` 是 Nginx 直接回應 `ok`，**完全不看 EFS**。如果新主機的 EFS 沒掛上（fstab 設了 `nofail`，掛載失敗也會照常開機），`/var/www/html` 會是空的，網站其實是壞的，但 ALB 還是判定 healthy，把訪客送過去。
+
+改成：找不到 `/var/www/html/wp-config.php`（代表 EFS 沒掛上）就回應 **503**，ALB 會判定這台主機不健康，2.7 的 Auto Scaling 會自動把它換掉。
+
+```bash
+grep -q 'wp-config.php' /etc/nginx/nginx.conf \
+  || sed -i 's|location = /healthz { access_log off; default_type text/plain; return 200 "ok"; }|location = /healthz { access_log off; default_type text/plain; if (!-f /var/www/html/wp-config.php) { return 503 "efs-missing"; } return 200 "ok"; }|' /etc/nginx/nginx.conf
+grep -n 'location = /healthz' /etc/nginx/nginx.conf
+nginx -t && systemctl reload nginx && echo "✅ Nginx 已重新載入"
+curl -s localhost/healthz; echo
+```
+
+| 指令 | 意思 |
+|---|---|
+| `grep -q ... \|\| sed -i ...` | 還沒改過才修改，重跑不會重複改 |
+| `if (!-f /var/www/html/wp-config.php) { return 503 ...; }` | 檔案不存在就回應 503 |
+| `nginx -t` | 先檢查設定檔語法，正確才重新載入，避免改壞造成網站停擺 |
+
+正確結果：
+
+```text
+16:        location = /healthz { access_log off; default_type text/plain; if (!-f /var/www/html/wp-config.php) { return 503 "efs-missing"; } return 200 "ok"; }
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+✅ Nginx 已重新載入
+ok
+```
+
+> ⚠️ 只在 2.6 做這個修改，**1.7 的 User data 不要改**。Phase 1 時還沒有 `wp-config.php`（1.10 才產生），改了會讓 1.9 的健康檢查失敗。
+> 如果 `grep -n` 那一行沒有出現 `if (!-f ...`，代表你的 Nginx 設定和指南不同，`sed` 找不到要取代的文字。執行 `grep -n healthz /etc/nginx/nginx.conf`，截圖貼到討論串。
+
+**步驟 3：刪除本機的舊網站檔案**
+
+2.2 搬到 EFS 時，原本的網站檔案保留在 `/var/www/html.local-backup`。現在 EFS 已經正常運作，這份舊檔案沒有用了。如果不刪，它會被打包進 AMI，之後每一台新主機都有一份。**裡面的 `wp-config.php` 還寫著資料庫密碼**，留著只會增加外洩的風險。
+
+先確認 2.5 的驗證都通過（`https://<CF_DOMAIN>` 正常、後台可登入），再執行：
+
+```bash
+if findmnt -n -o FSTYPE /var/www/html | grep -q nfs4 && [ -f /var/www/html/wp-config.php ]; then
+  rm -rf /var/www/html.local-backup && echo "✅ 已刪除 /var/www/html.local-backup"
+else
+  echo "❌ /var/www/html 目前不是 EFS，這次不刪除，請先檢查 2.2"
+fi
+```
+
+這段會先確認 `/var/www/html` 確實是 EFS，而且有 `wp-config.php`，兩者都成立才刪除，避免誤刪唯一的一份網站檔案。
+
+#### 2.6-2 建立 AMI `wp-web-ami-v1`
+
+> ⏱ 建立 AMI 時主機會**自動重開機一次**，網站會中斷約 **1–3 分鐘**（目前只有一台主機）。重開機可以確保硬碟資料完整寫入，請**不要**取消勾選 Reboot。
+
+**方法 A：主控台**
+
+1. **EC2 → Instances** → 勾選 **`wp-web-1`** → 右上 **Actions → Image and templates → Create image**。
+2. 填寫：
+
+| 欄位 | 設定 |
+|---|---|
+| **Image name** | `wp-web-ami-v1` |
+| **Image description** | `WordPress web server v1`（選填） |
+| **Reboot instance** | ✅ 保持勾選 |
+| **Instance volumes** | 保持預設（8 GiB、gp3、Delete on termination 勾選） |
+| **Tags** | 選 **Tag image and snapshots together** → **Add new tag**：Key `Name`、Value `wp-web-ami-v1` |
+
+3. 按 **Create image**。
+4. 左側 **Images → AMIs**，`wp-web-ami-v1` 的 **Status** 從 *Pending* 變成 **Available**，大約 **5–10 分鐘**。
+
+**方法 B：CloudShell 指令**
+
+```bash
+IID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=wp-web-1" "Name=instance-state-name,Values=running" \
+  --query "Reservations[0].Instances[0].InstanceId" --output text)
+AMI_ID=$(aws ec2 create-image --instance-id $IID --name wp-web-ami-v1 --description "WordPress web server v1" \
+  --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=wp-web-ami-v1}]" "ResourceType=snapshot,Tags=[{Key=Name,Value=wp-web-ami-v1}]" \
+  --query ImageId --output text)
+echo "AMI：$AMI_ID（等待變成 available，約 5–10 分鐘，期間畫面不會有輸出）"
+aws ec2 wait image-available --image-ids $AMI_ID && echo "✅ $AMI_ID 已是 available"
+```
+
+`create-image` 預設就會重開機（不加 `--no-reboot`）。
+
+#### 2.6-3 重開機後檢查 `wp-web-1`
+
+這次重開機是**第一次真正測試** 2.2 寫的 fstab：主機開機後，EFS 有沒有自動接上。用這台檢查過，之後的新主機才會一樣正常。
+
+AMI 變成 Available 後，在 **CloudShell** 執行：
+
+```bash
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+aws elbv2 describe-target-health --target-group-arn $TG_ARN --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State]" --output text
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CF_DOMAIN=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.DomainName" --output text)
+curl -s -m 15 "https://$CF_DOMAIN/healthz"; echo
+```
+
+- 目標狀態是 **`healthy`**，最後一行是 **`ok`**：EFS 有自動接上（`/healthz` 現在會檢查 EFS）。
+- 是 `unhealthy`：重新開 Session Manager，執行 `findmnt /var/www/html` 和 `tail -n 20 /var/log/amazon/efs/mount.log`。EFS 沒有接上時執行 `mount -a`，並對照 2.2 的排錯表。**修好前不要用這個 AMI**，修好後刪掉它（AMIs → Deregister，Snapshots → Delete），再做一次 2.6-2。
+
+#### 2.6-4 建立啟動範本 `wp-web-lt`
+
+**方法 A：主控台**
+
+1. **EC2** → 左側 **Instances → Launch Templates** → **Create launch template**。
+
+**Launch template name and description**
+
+| 欄位 | 設定 |
+|---|---|
+| **Launch template name** | `wp-web-lt` |
+| **Template version description** | `v1` |
+| **Auto Scaling guidance** | ✅ 勾選 **Provide guidance to help me set up a template that I can use with EC2 Auto Scaling**（會標示 Auto Scaling 需要的欄位） |
+
+**Application and OS Images (Amazon Machine Image)**
+
+2. 點 **My AMIs** 分頁 → 選 **Owned by me** → 選 **`wp-web-ami-v1`**。
+
+**Instance type**
+
+3. 選 **`t3.micro`**。
+
+**Key pair (login)**
+
+4. 選 **Don't include in launch template**（我們用 Session Manager，不用 SSH 金鑰）。
+
+**Network settings**
+
+5. **Subnet**：**Don't include in launch template**（子網路在 2.7 建立 Auto Scaling 時選）。
+6. **Firewall (security groups)**：⚠️ **保持空白，不要選任何安全群組**。安全群組要設在下一步的網路介面裡。
+7. 展開 **Advanced network configuration** → 按 **Add network interface**，填：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Device index** | `0` | 主機的第一張（主要）網路卡 |
+| **Network interface** | New interface（預設） | |
+| **Subnet** | **Don't include in launch template** | 由 Auto Scaling 決定 |
+| **Security groups** | **`wp-web-sg`** | ⚠️ 安全群組只能設在這裡。外層第 6 步也選了的話，會出現 *Network interfaces and an instance-level security groups may not be specified on the same request* |
+| **Auto-assign public IP** | **Enable** | 我們沒有 NAT Gateway，主機要有公有 IP 才能連到 SSM、CloudWatch、Secrets Manager 和下載更新 |
+| **Delete on termination** | **Yes** | 主機刪除時網路卡一起刪除，不會殘留 |
+
+   其他欄位保持預設。
+
+**Configure storage**
+
+8. 保持預設（AMI 帶入的 8 GiB gp3）。
+
+**Resource tags**
+
+9. 按 **Add new tag** 兩次：
+
+| Key | Value | Resource types |
+|---|---|---|
+| `Name` | `wp-web-asg` | **Instances** |
+| `Role` | `wordpress` | **Instances** |
+
+   `Role=wordpress` 很重要：Phase 3 的 AI Agent 用這個標籤找到要檢查的主機。
+
+**Advanced details**（展開）
+
+10. 填：
+
+| 欄位 | 設定 |
+|---|---|
+| **IAM instance profile** | **`wp-ec2-role`** |
+| **Metadata accessible** | **Enabled** |
+| **Metadata version** | **V2 only (token required)** |
+| **User data** | 保持空白（AMI 裡已經裝好所有東西） |
+
+    其他欄位保持預設。
+
+11. 右側 **Summary** 確認後，按 **Create launch template**。
+
+**方法 B：CloudShell 指令**
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+WEB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-web-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+AMI_ID=$(aws ec2 describe-images --owners self --filters Name=name,Values=wp-web-ami-v1 --query "Images[0].ImageId" --output text)
+echo "AMI：$AMI_ID    wp-web-sg：$WEB_SG"
+
+aws ec2 create-launch-template --launch-template-name wp-web-lt --version-description v1 \
+  --launch-template-data '{
+    "ImageId": "'"$AMI_ID"'",
+    "InstanceType": "t3.micro",
+    "IamInstanceProfile": {"Name": "wp-ec2-role"},
+    "NetworkInterfaces": [{"DeviceIndex": 0, "AssociatePublicIpAddress": true,
+                           "Groups": ["'"$WEB_SG"'"], "DeleteOnTermination": true}],
+    "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
+    "TagSpecifications": [{"ResourceType": "instance", "Tags": [
+      {"Key": "Name", "Value": "wp-web-asg"}, {"Key": "Role", "Value": "wordpress"}]}]
+  }' --query "LaunchTemplate.[LaunchTemplateName, LatestVersionNumber]" --output text
+```
+
+- AMI 和 `wp-web-sg` 都必須印出 `ami-`、`sg-` 開頭的 ID，是 `None` 就先不要往下做。
+- 最後印出 `wp-web-lt  1` 就成功了。
+
+#### 2.6-5 驗證 2.6（CloudShell）
+
+整段貼上：
+
+```bash
+AMI_ID=$(aws ec2 describe-images --owners self --filters Name=name,Values=wp-web-ami-v1 --query "Images[0].ImageId" --output text)
+AMI_STATE=$(aws ec2 describe-images --image-ids $AMI_ID --query "Images[0].State" --output text 2>/dev/null)
+[ "$AMI_STATE" = "available" ] && echo "✅ AMI $AMI_ID：available" || echo "❌ AMI 狀態：$AMI_STATE"
+
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=wp-vpc --query "Vpcs[0].VpcId" --output text)
+WEB_SG=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=$VPC_ID Name=group-name,Values=wp-web-sg \
+  --query "SecurityGroups[0].GroupId" --output text)
+aws ec2 describe-launch-template-versions --launch-template-name wp-web-lt --versions '$Latest' \
+  --query "LaunchTemplateVersions[0].LaunchTemplateData" > lt-check.json
+AMI_ID=$AMI_ID WEB_SG=$WEB_SG python3 - <<'PY'
+import json, os
+d = json.load(open("lt-check.json"))
+ni = (d.get("NetworkInterfaces") or [{}])[0]
+tags = {t["Key"]: t["Value"] for s in d.get("TagSpecifications", []) if s["ResourceType"] == "instance" for t in s["Tags"]}
+def chk(ok, good, bad): print(("✅ " + good) if ok else ("❌ " + bad))
+chk(d.get("ImageId") == os.environ["AMI_ID"], "AMI 是 wp-web-ami-v1", "AMI 不是 wp-web-ami-v1（目前：%s）" % d.get("ImageId"))
+chk(d.get("InstanceType") == "t3.micro", "主機類型 t3.micro", "主機類型：%s" % d.get("InstanceType"))
+chk(not d.get("SecurityGroupIds") and not d.get("SecurityGroups"), "外層沒有設定安全群組", "外層也設了安全群組，建立主機會失敗")
+chk(ni.get("Groups") == [os.environ["WEB_SG"]], "網路介面的安全群組是 wp-web-sg", "網路介面的安全群組不是 wp-web-sg（目前：%s）" % ni.get("Groups"))
+chk(ni.get("AssociatePublicIpAddress") is True, "自動指派公有 IP：Enable", "沒有自動指派公有 IP，新主機會連不到 SSM")
+chk(ni.get("DeviceIndex") == 0, "Device index 0", "Device index 不是 0")
+chk("SubnetId" not in ni, "沒有指定子網路", "網路介面指定了子網路，請改成 Don't include")
+chk("wp-ec2-role" in json.dumps(d.get("IamInstanceProfile", {})), "IAM 角色 wp-ec2-role", "沒有設定 IAM 角色 wp-ec2-role")
+chk(d.get("MetadataOptions", {}).get("HttpTokens") == "required", "Metadata：V2 only", "Metadata 不是 V2 only")
+chk(tags.get("Role") == "wordpress" and tags.get("Name") == "wp-web-asg", "標籤 Name=wp-web-asg、Role=wordpress", "標籤不正確（目前：%s）" % tags)
+PY
+```
+
+正確結果：
+
+```text
+✅ AMI ami-0abc1234def567890：available
+✅ AMI 是 wp-web-ami-v1
+✅ 主機類型 t3.micro
+✅ 外層沒有設定安全群組
+✅ 網路介面的安全群組是 wp-web-sg
+✅ 自動指派公有 IP：Enable
+✅ Device index 0
+✅ 沒有指定子網路
+✅ IAM 角色 wp-ec2-role
+✅ Metadata：V2 only
+✅ 標籤 Name=wp-web-asg、Role=wordpress
+```
+
+**有 ❌ 時怎麼改**：啟動範本**不能直接修改**，只能建立新版本。到 **Launch Templates** → 勾選 `wp-web-lt` → **Actions → Modify template (Create new version)** → 改好有問題的欄位 → **Create template version**。驗證會自動檢查最新版本，2.7 也會選 *Latest*。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| ❌ 外層也設了安全群組 | 第 6 步選了安全群組 | 建立新版本，Firewall 改成 *Don't include in launch template* |
+| ❌ 沒有自動指派公有 IP | 網路介面的 Auto-assign public IP 沒選 Enable | 建立新版本修改。沒有公有 IP 的新主機連不到 SSM，也無法通過健康檢查 |
+| AMI 一直是 *Pending* | 硬碟比較大或 AWS 正忙 | 再等 10 分鐘；超過 30 分鐘仍是 Pending，可以刪掉重做 |
+| AMI 是 *Failed* | 建立失敗 | AMIs → Deregister，再做一次 2.6-2 |
+| 找不到 `wp-web-ami-v1` | 不在 My AMIs → Owned by me，或區域不是東京 | 確認右上角區域是 ap-northeast-1 |
+
+#### 2.6-6 注意事項
+
+> 💰 **公有 IP 費用**：AWS 對每個公有 IPv4 位址收費，約每小時 $0.005（每台主機每月約 $3.6）。Auto Scaling 擴充到 2 台時就是 2 個。這是不用 NAT Gateway（每月約 $45）的代價，整體還是比較便宜。
+
+> 📦 **AMI 也要錢**：AMI 背後是 EBS 快照，8 GiB 每月約 $0.4。做了新版本之後，舊版 AMI 和快照記得刪除（AMIs → Deregister，Snapshots → Delete）。
+
+> 🔄 **之後要更新主機時**（例如更新套件、改 Nginx 設定），不要只改正在執行的主機，因為 Auto Scaling 開的新主機還是舊的。正確做法：
+> 1. 在其中一台主機做好修改並測試。
+> 2. 用它做新的 AMI：`wp-web-ami-v2`。
+> 3. 啟動範本 **Modify template (Create new version)**，只把 AMI 換成 v2。
+> 4. **Auto Scaling Groups → wp-asg → Instance refresh → Start instance refresh**，Auto Scaling 會逐台換成新主機，網站不中斷。
+> 5. 確認正常後，刪除舊版 AMI 和快照。
+
+> ℹ️ 已經處理過、不用擔心的兩件事：
+> - **每台主機都會跑每日備份**：備份檔名包含主機名稱，不會互相覆蓋（2.1 步驟 5）。
+> - **`wp-cpu-high` 告警綁在 `wp-web-1`**：2.7 退役 `wp-web-1` 後它會變成 *Insufficient data*，2.8 會改成觀察整個 Auto Scaling 群組。
 
 ### 2.7 建立 Auto Scaling Group
 
@@ -4293,6 +4599,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.6（10/28 審核） | 做 AMI 前沒有檢查；`/healthz` 不檢查 EFS，EFS 沒掛上的主機也會被判定健康；重開機後沒有確認；沒有驗證；舊網站檔案（含資料庫密碼）會被打包進 AMI；網路介面欄位不完整 | 改寫為 2.6-1～2.6-6：做 AMI 前檢查與整理（服務開機自動啟動、`/healthz` 檢查 `wp-config.php`、刪除 local-backup）、AMI 主控台／CLI、重開機後檢查、啟動範本逐欄位設定與 CLI、一鍵驗證與排錯、公有 IP 費用與日後更新 AMI 的流程 |
 | 2.5-2 步驟 3（10/28 補充） | 安全群組改成 CloudFront 前綴清單的步驟太簡略 | 拆成 3-1～3-3 逐畫面步驟，解釋前綴清單與「刪掉再新增」的原因、規則上限，加上可單獨執行的檢查與排錯表 |
 | 2.5-2（10/28 補充） | 收緊 ALB 只有四行說明 | 說明兩道鎖（CloudFront 前綴清單＋暗號標頭）與「先加規則再改預設」的順序；主控台新增規則 5 個畫面、預設規則改 403、安全群組刪除後新增；CLI 自動從 CloudFront 讀出暗號；一鍵驗證、瀏覽器確認與排錯表 |
 | 2.5-1（10/28 實作） | 把 `OLD=http://<EIP>` 原樣貼上，`<` 被 bash 當成重新導向，出現 `syntax error near unexpected token 'newline'`，網址變數是空的 | EIP 改從主機中繼資料自動取得，只需填 CloudFront 網域並自動檢查格式；wp-config 修改改成不會重複加入；加上逐段解釋、正確輸出、驗證與排錯表 |
