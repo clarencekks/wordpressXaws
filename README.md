@@ -3073,23 +3073,84 @@ php -l wp-config.php
 
 **步驟 3：安全群組只允許 CloudFront**
 
-和 2.3 ④ 一樣，主控台**不能直接把 `0.0.0.0/0` 改成前綴清單**，要刪掉舊規則、再新增一條：
+**這一步在做什麼**：`wp-alb-sg` 目前有一條「HTTP 80、來源 `0.0.0.0/0`」的規則，代表全世界任何 IP 都能連到 ALB。我們要把來源換成 **CloudFront 的 IP 清單**，從此只有 CloudFront 的伺服器連得進來。
 
-1. 主控台搜尋 **VPC** → 左側 **Security groups** → 勾選 **`wp-alb-sg`** → **Inbound rules** 分頁 → **Edit inbound rules**。
-2. 在 HTTP、80、`0.0.0.0/0` 那一列，按 **Delete**。
-3. 按 **Add rule**：
+```
+改之前：wp-alb-sg  HTTP 80  來源 0.0.0.0/0                                  → 任何人都能連
+改之後：wp-alb-sg  HTTP 80  來源 pl-xxxx（cloudfront.origin-facing 前綴清單） → 只有 CloudFront 能連
+```
 
-| 欄位 | 設定 |
-|---|---|
-| **Type** | **HTTP**（Port 自動帶出 `80`） |
-| **Source** | **Custom** → 在搜尋框輸入 `cloudfront` → 在 **Prefix lists** 分類下選 **`pl-xxxxxxxx (com.amazonaws.global.cloudfront.origin-facing)`** |
-| **Description** | `HTTP from CloudFront only` |
+> **什麼是前綴清單（Prefix list）？** 就是「一組 IP 範圍」打包成一個名字。CloudFront 在全球有幾百個 IP 範圍，不可能一條一條加。AWS 把它們整理成 `com.amazonaws.global.cloudfront.origin-facing`（名稱中的 *origin-facing* 意思是「CloudFront 連到你的來源時用的 IP」），IP 有增減時 **AWS 會自動更新**，你不用管。
 
-   ⚠️ 選 `com.amazonaws.global.cloudfront.origin-facing`，不要選名稱裡沒有 `origin-facing` 的清單。
+> **為什麼要「刪掉再新增」？** 主控台不允許把一條原本是 IP 範圍（`0.0.0.0/0`）的規則，直接改成前綴清單或安全群組，會出現 *You may not specify a referenced group id for an existing IPv4 CIDR rule*（2.3 ④ 遇過）。所以要先刪舊的、再加新的。兩個動作會在同一次 **Save rules** 一起生效，中間不會斷線。
 
-4. 確認只剩這一條規則 → **Save rules**。
+**3-1. 打開 `wp-alb-sg` 的 inbound 規則**
 
-> 💡 如果儲存時出現 *The maximum number of rules per security group has been reached*：這份前綴清單有幾十個 IP 範圍，每個都算一條規則，可能超過安全群組預設的 60 條上限。到 **Service Quotas → Amazon VPC → Inbound or outbound rules per security group** 申請提高到 120，或只保留第 2 道鎖（暗號），先跳過這一步。
+1. 主控台上方搜尋 **VPC** → 進入 VPC 主控台。
+2. 左側選單 **Security → Security groups**。
+3. 在列表中找到 **Security group name** 是 **`wp-alb-sg`** 的那一列，勾選它。（找不到時，在上方搜尋框輸入 `wp-alb`。）
+4. 畫面下方點 **Inbound rules** 分頁。現在應該看到**一條**規則：
+
+| Type | Protocol | Port range | Source |
+|---|---|---|---|
+| HTTP | TCP | 80 | `0.0.0.0/0` |
+
+5. 按右邊的 **Edit inbound rules**。
+
+**3-2. 刪掉 `0.0.0.0/0` 那一條**
+
+6. 在 `HTTP`、`80`、`0.0.0.0/0` 那一列，按最右邊的 **Delete**。那一列會消失。
+   - 如果還有 Source 是 `::/0` 的 HTTP 規則（IPv6 的「所有人」），也一起 **Delete**。
+
+**3-3. 新增「只允許 CloudFront」的規則**
+
+7. 按左下 **Add rule**，會多出一列空白規則。依序填：
+
+| 欄位 | 怎麼填 | 說明 |
+|---|---|---|
+| **Type** | 下拉選 **HTTP** | **Protocol** 自動變成 TCP，**Port range** 自動變成 `80` |
+| **Source type** | **Custom** | |
+| **Source**（旁邊的搜尋框） | 輸入 `cloudfront`，下拉選單會分成 *CIDR blocks*、*Security Groups*、*Prefix lists* 幾類。在 **Prefix lists** 底下點選 **`pl-xxxxxxxx`（`com.amazonaws.global.cloudfront.origin-facing`）** | 選好後搜尋框會顯示一個 `pl-` 開頭的標籤 |
+| **Description** | `HTTP from CloudFront only` | 選填，只能用英文 |
+
+   ⚠️ 名稱一定要有 **`origin-facing`**。如果下拉選單沒有出現，確認右上角區域是**東京（ap-northeast-1）**，並且 Type 已經選好 HTTP。
+   ⚠️ 搜尋框裡**只能有** `pl-xxxx` 這一個標籤。如果還有 `0.0.0.0/0`，按它旁邊的 **X** 刪掉。
+
+8. 檢查畫面：現在**只剩一條**規則：
+
+| Type | Protocol | Port range | Source | Description |
+|---|---|---|---|---|
+| HTTP | TCP | 80 | Custom：`pl-xxxxxxxx` | HTTP from CloudFront only |
+
+9. 按右下 **Save rules**。畫面上方出現綠色的 *Inbound security group rules successfully modified* 就完成了，**立刻生效**。
+
+> 💡 **如果按 Save rules 出現 *The maximum number of rules per security group has been reached***：前綴清單裡的每個 IP 範圍都算一條規則，CloudFront 這份大約佔 55 條，而一個安全群組預設最多 60 條 inbound 規則。只要 `wp-alb-sg` 裡**只有這一條**，就放得下。出現這個錯誤通常是還有其他規則沒刪（例如 `::/0`、443），刪掉後再存一次。真的需要更多規則時，到 **Service Quotas → Amazon Virtual Private Cloud (Amazon VPC) → Inbound or outbound rules per security group** 申請提高。
+
+✅ **檢查步驟 3**（CloudShell，可以單獨執行）：
+
+```bash
+ALB_SG=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].SecurityGroups[0]" --output text)
+aws ec2 describe-security-group-rules --filters Name=group-id,Values=$ALB_SG \
+  --query "SecurityGroupRules[?IsEgress==\`false\`].{Port:FromPort, FromCIDR:CidrIpv4, FromIPv6:CidrIpv6, FromPrefixList:PrefixListId}" \
+  --output table
+PL=$(aws ec2 describe-security-group-rules --filters Name=group-id,Values=$ALB_SG \
+  --query "SecurityGroupRules[?IsEgress==\`false\`].PrefixListId | [0]" --output text)
+aws ec2 describe-managed-prefix-lists --prefix-list-ids $PL --query "PrefixLists[0].PrefixListName" --output text
+ALB_DNS=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].DNSName" --output text)
+curl -s -m 5 -o /dev/null -w "直接連 ALB：HTTP %{http_code}（000 代表被擋下，正確）\n" "http://$ALB_DNS/"
+```
+
+正確結果：
+- 表格只有**一列**：Port `80`、FromPrefixList 是 `pl-` 開頭，FromCIDR 和 FromIPv6 都是 `None`。
+- 下一行印出 `com.amazonaws.global.cloudfront.origin-facing`。
+- 最後一行是 `HTTP 000`。CloudShell 不是 CloudFront，所以被擋下（要等 5 秒）。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| 表格有兩列，其中一列 FromCIDR 是 `0.0.0.0/0` | 舊規則沒刪掉 | 回到 3-2，刪掉那一列 → Save rules |
+| 印出的名稱不是 `...cloudfront.origin-facing` | 選錯前綴清單 | Edit inbound rules → 刪掉那條 → 照 3-3 重新新增 |
+| 直接連 ALB 還是 `HTTP 200` 或 `403` | `0.0.0.0/0` 還在（或剛改完，等幾秒再試） | 同第一列 |
+| 改完後透過 CloudFront 變成 **504** | 來源不是 CloudFront 的清單 | 確認名稱是 `origin-facing` 那份 |
 
 **方法 B：CloudShell 指令**
 
@@ -3138,7 +3199,7 @@ fi
 
 - `暗號長度` 必須是 `32`。
 - 出現 `InvalidPermission.Duplicate`（規則已經存在）或 `InvalidPermission.NotFound`（舊規則已經刪掉）都沒關係，直接做驗證。
-- 出現 `RulesPerSecurityGroupLimitExceeded`，看方法 A 步驟 3 最後的說明。
+- 出現 `RulesPerSecurityGroupLimitExceeded`，看方法 A 步驟 3-3 的說明。
 
 ✅ **驗證 2.5**（CloudShell）：等 1–2 分鐘讓設定生效，整段貼上：
 
@@ -4232,6 +4293,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.5-2 步驟 3（10/28 補充） | 安全群組改成 CloudFront 前綴清單的步驟太簡略 | 拆成 3-1～3-3 逐畫面步驟，解釋前綴清單與「刪掉再新增」的原因、規則上限，加上可單獨執行的檢查與排錯表 |
 | 2.5-2（10/28 補充） | 收緊 ALB 只有四行說明 | 說明兩道鎖（CloudFront 前綴清單＋暗號標頭）與「先加規則再改預設」的順序；主控台新增規則 5 個畫面、預設規則改 403、安全群組刪除後新增；CLI 自動從 CloudFront 讀出暗號；一鍵驗證、瀏覽器確認與排錯表 |
 | 2.5-1（10/28 實作） | 把 `OLD=http://<EIP>` 原樣貼上，`<` 被 bash 當成重新導向，出現 `syntax error near unexpected token 'newline'`，網址變數是空的 | EIP 改從主機中繼資料自動取得，只需填 CloudFront 網域並自動檢查格式；wp-config 修改改成不會重複加入；加上逐段解釋、正確輸出、驗證與排錯表 |
 | 2.4 方法 A（10/28 實作） | 實際畫面沒有「Choose a plan」這一頁 | 方案選擇改成「有看到就選 Free，沒有就直接往下做（Pay-as-you-go）」；WAF 步驟依方案分成兩種做法 |
