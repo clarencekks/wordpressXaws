@@ -3411,7 +3411,7 @@ fi
 | **Image name** | `wp-web-ami-v1` |
 | **Image description** | `WordPress web server v1`（選填） |
 | **Reboot instance** | ✅ 保持勾選 |
-| **Instance volumes** | 保持預設（8 GiB、gp3、Delete on termination 勾選） |
+| **Instance volumes** | 保持預設（**20 GiB**、gp3、Delete on termination 勾選），和 1.7 建立 `wp-web-1` 時設定的大小相同 |
 | **Tags** | 選 **Tag image and snapshots together** → **Add new tag**：Key `Name`、Value `wp-web-ami-v1` |
 
 3. 按 **Create image**。
@@ -3493,7 +3493,7 @@ curl -s -m 15 "https://$CF_DOMAIN/healthz"; echo
 
 **Configure storage**
 
-8. 保持預設（AMI 帶入的 8 GiB gp3）。
+8. 保持預設：會自動帶入 AMI 的 **20 GiB gp3**（就是 1.7 設定的大小）。⚠️ 不要改小，硬碟不能比 AMI 小，否則會建立失敗。每台主機的硬碟每月約 $2。
 
 **Resource tags**
 
@@ -3609,7 +3609,7 @@ PY
 
 > 💰 **公有 IP 費用**：AWS 對每個公有 IPv4 位址收費，約每小時 $0.005（每台主機每月約 $3.6）。Auto Scaling 擴充到 2 台時就是 2 個。這是不用 NAT Gateway（每月約 $45）的代價，整體還是比較便宜。
 
-> 📦 **AMI 也要錢**：AMI 背後是 EBS 快照，8 GiB 每月約 $0.4。做了新版本之後，舊版 AMI 和快照記得刪除（AMIs → Deregister，Snapshots → Delete）。
+> 📦 **AMI 也要錢**：AMI 背後是 EBS 快照。快照只依**實際用到的空間**計費（20 GiB 的硬碟大約用了 3–5 GB），每月約 $0.2–0.3。做了新版本之後，舊版 AMI 和快照記得刪除（AMIs → Deregister，Snapshots → Delete）。
 
 > 🔄 **之後要更新主機時**（例如更新套件、改 Nginx 設定），不要只改正在執行的主機，因為 Auto Scaling 開的新主機還是舊的。正確做法：
 > 1. 在其中一台主機做好修改並測試。
@@ -4599,6 +4599,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.6 硬碟大小（10/28） | AMI 和啟動範本寫成 8 GiB，但 1.7 建立主機時設定的是 20 GiB | 改成 20 GiB，說明啟動範本不能改小，修正快照費用說明 |
 | 2.6（10/28 審核） | 做 AMI 前沒有檢查；`/healthz` 不檢查 EFS，EFS 沒掛上的主機也會被判定健康；重開機後沒有確認；沒有驗證；舊網站檔案（含資料庫密碼）會被打包進 AMI；網路介面欄位不完整 | 改寫為 2.6-1～2.6-6：做 AMI 前檢查與整理（服務開機自動啟動、`/healthz` 檢查 `wp-config.php`、刪除 local-backup）、AMI 主控台／CLI、重開機後檢查、啟動範本逐欄位設定與 CLI、一鍵驗證與排錯、公有 IP 費用與日後更新 AMI 的流程 |
 | 2.5-2 步驟 3（10/28 補充） | 安全群組改成 CloudFront 前綴清單的步驟太簡略 | 拆成 3-1～3-3 逐畫面步驟，解釋前綴清單與「刪掉再新增」的原因、規則上限，加上可單獨執行的檢查與排錯表 |
 | 2.5-2（10/28 補充） | 收緊 ALB 只有四行說明 | 說明兩道鎖（CloudFront 前綴清單＋暗號標頭）與「先加規則再改預設」的順序；主控台新增規則 5 個畫面、預設規則改 403、安全群組刪除後新增；CLI 自動從 CloudFront 讀出暗號；一鍵驗證、瀏覽器確認與排錯表 |
