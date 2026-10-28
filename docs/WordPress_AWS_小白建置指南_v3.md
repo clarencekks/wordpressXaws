@@ -2656,15 +2656,15 @@ aws secretsmanager get-random-password --password-length 32 --exclude-punctuatio
 
 下面兩種方法**擇一**即可。
 
-#### 方法 A：主控台（Free 方案）
+#### 方法 A：主控台
 
 > 主控台精靈的頁面名稱可能隨 AWS 改版略有不同。遇到對不上的畫面，截圖貼到討論串，我再補上。精靈裡沒設好的項目，建立後都可以在「2.4-3 建立後檢查與補設定」改回來。
 
 1. 主控台上方搜尋 **CloudFront** → 左側 **Distributions** → **Create distribution**。
 
-**Choose a plan（選擇方案）**
-
-2. 選 **Free** → **Next**。
+2. **方案選擇不一定會出現在第一頁**。依帳號和主控台版本，可能出現在第一頁、最後的確認頁，或完全沒有：
+   - **有看到 Free／Pro／Business／Premium 選項** → 選 **Free**。
+   - **完全沒有方案選項**（實測 2026-10-28 的畫面就是這樣）→ 不用找，直接往下做。這樣建立的就是 **Pay-as-you-go**，有每月 1 TB 的永久免費額度，練習一樣是 $0。
 
 **Get started（開始）**
 
@@ -2702,7 +2702,9 @@ aws secretsmanager get-random-password --password-length 32 --exclude-punctuatio
 
 **Enable security protections（WAF）**
 
-6. Free 方案會自動啟用 WAF（內含、不另外收費），保持預設 → **Next**。
+6. 依你的方案選擇：
+   - **Pay-as-you-go（沒有選方案）**：選 **Do not enable security protections** → **Next**。WAF 另外計費，每月約 $5 起，練習先不開；正式網站建議開啟。
+   - **Free 方案**：WAF 是方案內含、不另外收費，會自動啟用，保持預設 → **Next**。
 
 **Review and create（確認並建立）**
 
@@ -3912,6 +3914,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.4 方法 A（10/28 實作） | 實際畫面沒有「Choose a plan」這一頁 | 方案選擇改成「有看到就選 Free，沒有就直接往下做（Pay-as-you-go）」；WAF 步驟依方案分成兩種做法 |
 | 2.4（10/28 實作） | 新版主控台建立 distribution 時先選月費方案，畫面看不到 Pay-as-you-go，指南寫的選項對不上 | 改寫 2.4：方案比較表（建議 Free）與四個注意事項；方法 A 依新精靈逐頁說明，強調來源要改 HTTP only（推薦設定是 HTTPS only 會 502）；方法 B 用 CLI 建立 Pay-as-you-go；建立後檢查、一鍵驗證與排錯表；清除步驟加上先取消 Free 方案 |
 | 2.3 ④（10/27 補充、實作） | 收緊 `wp-web-sg` 只有一行說明；實作時直接改 Source 出現 *You may not specify a referenced group id for an existing IPv4 CIDR rule* | 改成主控台「刪掉舊規則、Add rule 新增」的步驟、先加後刪的 CLI 做法、驗證腳本（規則、ALB 通、EIP 不通）與排錯表；修正「做完 ④ 網站就無法瀏覽」的說法 |
 | 2.3 ③驗證（10/27 實作） | 網址只印在輸出最上方容易被捲走；實際首頁回應 200，不是 301 | 最後一行再印一次 ALB DNS name，並說明主控台哪裡複製；說明首頁 200 或 301 都正常 |
