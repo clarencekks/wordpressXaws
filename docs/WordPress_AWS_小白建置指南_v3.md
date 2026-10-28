@@ -2888,24 +2888,105 @@ http 自動轉 https：301 → https://d1234abcd.cloudfront.net/healthz
 
 ### 2.5 讓 WordPress 改用 CloudFront 網址
 
-在 Session Manager（root）：
+**為什麼需要**：WordPress 會記住自己的網址（`home`、`siteurl`），文章裡的圖片和連結也都寫著這個網址。目前記的是 `http://<EIP>`，所以從 CloudFront 打開網站時，會被導回 EIP，而 EIP 在 2.3 ④ 之後已經打不開了。這一步要把網址全部換成 `https://<CF_DOMAIN>`。
+
+#### 2.5-1 修改 WordPress 設定（Session Manager，root）
+
+**開始前先準備**：2.4 記下的 CloudFront 網域（`dxxxx.cloudfront.net`）。到 **CloudFront → Distributions → `wp-cf`** 的 **Distribution domain name** 也可以複製。
+
+> ⚠️ **不要把 `<EIP>`、`<CF_DOMAIN>` 這種含 `<` `>` 的文字原樣貼進終端機。** `<` 在 bash 是「從檔案讀入」的符號，會出現 `syntax error near unexpected token 'newline'`，變數也會是空的。下面的指令已經改成自動取得 EIP，只有 CloudFront 網域要你填。
+
+Session Manager 登入 `wp-web-1`，執行 `sudo -i`，然後**先改第一行**再整段貼上：
+
+```bash
+CF_DOMAIN=d1234abcd.cloudfront.net     # ← 換成你的 CloudFront 網域（不要加 https://、不要加 < >）
+
+cd /var/www/html
+case "$CF_DOMAIN" in
+  d1234abcd.cloudfront.net) echo "❌ 還沒把第一行換成你的 CloudFront 網域，這次不會修改任何東西";;
+  *.cloudfront.net)
+    # 自動取得這台主機的 EIP（從 EC2 的中繼資料服務）
+    TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+    EIP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+    OLD="http://$EIP"
+    NEW="https://$CF_DOMAIN"
+    echo "目前 WordPress 記的網址：$(sudo -u apache wp option get home)"
+    echo "要換掉的舊網址：$OLD"
+    echo "要換成的新網址：$NEW"
+
+    # 1) 告訴 WordPress：帶著暗號標頭的請求（來自 CloudFront）都是 HTTPS
+    grep -q HTTP_X_ORIGIN_VERIFY wp-config.php \
+      || sed -i "1a if (isset(\$_SERVER['HTTP_X_ORIGIN_VERIFY'])) { \$_SERVER['HTTPS'] = 'on'; }" wp-config.php
+    head -3 wp-config.php
+
+    # 2) 換網址
+    sudo -u apache wp option update home "$NEW"
+    sudo -u apache wp option update siteurl "$NEW"
+    sudo -u apache wp search-replace "$OLD" "$NEW" --skip-columns=guid
+    ;;
+  *) echo "❌ 第一行的網域格式不對（要是 xxxx.cloudfront.net），這次不會修改任何東西";;
+esac
+```
+
+**每一段在做什麼：**
+
+| 指令 | 意思 |
+|---|---|
+| `TOKEN=...`、`EIP=...` | 向 EC2 中繼資料服務查詢這台主機的公開 IP，就不用手動填 EIP |
+| `grep -q ... \|\| sed -i "1a ..."` | 在 `wp-config.php` 第 2 行加一行 PHP：請求帶有 `X-Origin-Verify` 標頭（代表來自 CloudFront）時，告訴 WordPress 這是 HTTPS 連線。前面的 `grep -q` 會先檢查，**已經加過就不會重複加** |
+| `wp option update home／siteurl` | 把 WordPress 記的網站網址、程式網址換成 CloudFront 網址 |
+| `wp search-replace` | 把資料庫中文章、設定裡所有舊網址換成新網址。`--skip-columns=guid` 表示不改文章的唯一識別碼（WordPress 官方建議） |
+
+> 💡 為什麼需要第 1 段：CloudFront 用 HTTPS 接待訪客，但轉給 ALB 和主機時是 HTTP。如果不告訴 WordPress，它會以為訪客用的是 http，然後一直把訪客導向 https，造成**無限轉址（ERR_TOO_MANY_REDIRECTS）**。
+
+正確結果類似：
+
+```text
+目前 WordPress 記的網址：http://13.192.60.150
+要換掉的舊網址：http://13.192.60.150
+要換成的新網址：https://d1234abcd.cloudfront.net
+<?php
+if (isset($_SERVER['HTTP_X_ORIGIN_VERIFY'])) { $_SERVER['HTTPS'] = 'on'; }
+/**
+Success: Updated 'home' option.
+Success: Updated 'siteurl' option.
++------------------+-----------------------+--------------+------+
+| Table            | Column                | Replacements | Type |
++------------------+-----------------------+--------------+------+
+| wp_options       | option_value          | 1            | SQL  |
+| wp_posts         | post_content          | 2            | SQL  |
+...
+Success: Made 3 replacements.
+```
+
+- 「要換掉的舊網址」必須是 `http://` 加上你的 EIP。
+- `head -3` 的第 2 行必須是 `if (isset($_SERVER['HTTP_X_ORIGIN_VERIFY'])) ...`，而且**只出現一次**。
+- `search-replace` 的取代數量可能是 0，代表文章裡本來就沒有舊網址，也是正常的。
+
+✅ **驗證 2.5-1**（同一個 Session Manager 視窗）：
 
 ```bash
 cd /var/www/html
-
-# 1) 告訴 WordPress：來自 CloudFront 的流量都是 HTTPS（加在 wp-config.php 最前面）
-sed -i "1a if (isset(\$_SERVER['HTTP_X_ORIGIN_VERIFY'])) { \$_SERVER['HTTPS'] = 'on'; }" wp-config.php
-head -3 wp-config.php
-
-# 2) 把網站網址從 IP 換成 CloudFront 網域
-OLD=http://<EIP>
-NEW=https://<CF_DOMAIN>
-sudo -u apache wp option update home "$NEW"
-sudo -u apache wp option update siteurl "$NEW"
-sudo -u apache wp search-replace "$OLD" "$NEW" --skip-columns=guid
+echo "home：   $(sudo -u apache wp option get home)"
+echo "siteurl：$(sudo -u apache wp option get siteurl)"
+N=$(grep -c HTTP_X_ORIGIN_VERIFY wp-config.php)
+[ "$N" = "1" ] && echo "✅ wp-config.php 有 HTTPS 判斷（1 行）" || echo "❌ wp-config.php 的 HTTPS 判斷有 $N 行（應該是 1 行）"
+php -l wp-config.php
 ```
 
-**收緊 ALB，只接受 CloudFront：**
+- `home` 和 `siteurl` 都必須是 `https://dxxxx.cloudfront.net`（不能是空白，結尾不要有 `/`）。
+- 最後一行要出現 `No syntax errors detected in wp-config.php`。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| `syntax error near unexpected token 'newline'` | 把含 `<` `>` 的文字原樣貼進終端機 | 用上面的新版指令，只改第一行的網域 |
+| `Value passed for 'home' option is unchanged` 且 `Replacement value '' is identical to search value ''` | 變數是空的，**什麼都沒改** | 用新版指令重跑一次 |
+| `home` 是空白 | 曾經把空白值寫進去 | 用新版指令重跑一次，會直接寫入正確網址 |
+| HTTPS 判斷有 2 行以上 | 舊版指令重跑過，重複加入 | `sed -i '3{/HTTP_X_ORIGIN_VERIFY/d}' wp-config.php` 刪掉第 3 行重複的那行，再跑一次驗證 |
+| `php -l` 顯示 syntax error | `wp-config.php` 被改壞 | 執行 `head -5 wp-config.php` 截圖貼到討論串 |
+
+#### 2.5-2 收緊 ALB，只接受 CloudFront
+
 
 1. **EC2 → Load Balancers → wp-alb → Listeners → HTTP:80 → Manage rules**（或 **View/edit rules**）。
 2. 新增規則：Condition **HTTP header** `X-Origin-Verify` 等於 `<ORIGIN_SECRET>` → Action **Forward to `wp-tg`**，Priority `1`。
@@ -3914,6 +3995,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.5-1（10/28 實作） | 把 `OLD=http://<EIP>` 原樣貼上，`<` 被 bash 當成重新導向，出現 `syntax error near unexpected token 'newline'`，網址變數是空的 | EIP 改從主機中繼資料自動取得，只需填 CloudFront 網域並自動檢查格式；wp-config 修改改成不會重複加入；加上逐段解釋、正確輸出、驗證與排錯表 |
 | 2.4 方法 A（10/28 實作） | 實際畫面沒有「Choose a plan」這一頁 | 方案選擇改成「有看到就選 Free，沒有就直接往下做（Pay-as-you-go）」；WAF 步驟依方案分成兩種做法 |
 | 2.4（10/28 實作） | 新版主控台建立 distribution 時先選月費方案，畫面看不到 Pay-as-you-go，指南寫的選項對不上 | 改寫 2.4：方案比較表（建議 Free）與四個注意事項；方法 A 依新精靈逐頁說明，強調來源要改 HTTP only（推薦設定是 HTTPS only 會 502）；方法 B 用 CLI 建立 Pay-as-you-go；建立後檢查、一鍵驗證與排錯表；清除步驟加上先取消 Free 方案 |
 | 2.3 ④（10/27 補充、實作） | 收緊 `wp-web-sg` 只有一行說明；實作時直接改 Source 出現 *You may not specify a referenced group id for an existing IPv4 CIDR rule* | 改成主控台「刪掉舊規則、Add rule 新增」的步驟、先加後刪的 CLI 做法、驗證腳本（規則、ALB 通、EIP 不通）與排錯表；修正「做完 ④ 網站就無法瀏覽」的說法 |
