@@ -3618,7 +3618,16 @@ PY
 
 1. **EC2 → Auto Scaling Groups → Create Auto Scaling group**。
 2. Name `wp-asg`；Launch template `wp-web-lt`（Version: Latest）→ Next。
-3. Network：VPC `wp-vpc`；Availability Zones and subnets 選**兩個 public 子網路** → Next。
+3. **Network**：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **VPC** | **`wp-vpc`** | ⚠️ 預設可能是 default VPC，要改 |
+| **Availability Zones and subnets** | 選 **`wp-subnet-public1-ap-northeast-1a`** 和 **`wp-subnet-public2-ap-northeast-1c`** | 兩個 public 子網路；不要選 private 子網路（沒有對外路由，新主機連不到 SSM） |
+| **Availability Zone distribution**（標示 *new*） | **Balanced best effort**（預設） | 盡量讓主機平均分在兩個 AZ；某個 AZ 開不出主機時，改到另一個 AZ 開。另一個選項 *Balanced only* 會在失敗的 AZ 一直重試，主機可能遲遲補不上，不適合我們 |
+| **Additional capacity settings**（展開後的 **Capacity Reservation preference**） | **Default**（保持預設，不用展開修改） | 這是給「預先買好的保留容量」用的，我們沒有購買，保持預設就是一般的隨需（On-Demand）主機 |
+
+   按 **Next**。
 4. Load balancing：**Attach to an existing load balancer** → **Choose from your load balancer target groups** → `wp-tg`。
    - 勾選 **Turn on Elastic Load Balancing health checks**；Health check grace period `300` 秒 → Next。
 5. Group size：Desired **1**、Min **1**、Max **2**。
@@ -4591,6 +4600,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.7 Network（10/28 實作） | 新版主控台多了 Availability Zone distribution 和 Additional capacity settings，指南沒有提到 | 改成欄位表：選 Balanced best effort、Capacity Reservation preference 保持 Default，並說明原因 |
 | 2.6 硬碟大小（10/28） | AMI 和啟動範本寫成 8 GiB，但 1.7 建立主機時設定的是 20 GiB | 改成 20 GiB，說明啟動範本不能改小，修正快照費用說明 |
 | 2.6（10/28 審核） | 做 AMI 前沒有檢查；`/healthz` 不檢查 EFS，EFS 沒掛上的主機也會被判定健康；重開機後沒有確認；沒有驗證；舊網站檔案（含資料庫密碼）會被打包進 AMI；網路介面欄位不完整 | 改寫為 2.6-1～2.6-6：做 AMI 前檢查與整理（服務開機自動啟動、`/healthz` 檢查 `wp-config.php`、刪除 local-backup）、AMI 主控台／CLI、重開機後檢查、啟動範本逐欄位設定與 CLI、一鍵驗證與排錯、公有 IP 費用與日後更新 AMI 的流程 |
 | 2.5-2 步驟 3（10/28 補充） | 安全群組改成 CloudFront 前綴清單的步驟太簡略 | 拆成 3-1～3-3 逐畫面步驟，解釋前綴清單與「刪掉再新增」的原因、規則上限，加上可單獨執行的檢查與排錯表 |
