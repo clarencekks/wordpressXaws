@@ -2995,7 +2995,6 @@ php -l wp-config.php
 
 #### 2.5-2 收緊 ALB，只接受 CloudFront
 
-
 1. **EC2 → Load Balancers → wp-alb → Listeners → HTTP:80 → Manage rules**（或 **View/edit rules**）。
 2. 新增規則：Condition **HTTP header** `X-Origin-Verify` 等於 `<ORIGIN_SECRET>` → Action **Forward to `wp-tg`**，Priority `1`。
 3. 把 **Default action** 改成 **Return fixed response**：狀態碼 `403`、內容 `Forbidden`。
