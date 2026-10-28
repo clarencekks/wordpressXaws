@@ -2601,39 +2601,288 @@ i-0abc123def4567890	healthy
 
 ### 2.4 建立 CloudFront（全球加速 + 免費 HTTPS）
 
-先在 CloudShell 產生一組「暗號」，讓 ALB 只接受來自 CloudFront 的流量：
+**為什麼需要**：CloudFront 是 AWS 的 CDN（內容傳遞網路），在全球有幾百個節點。
+
+- **免費 HTTPS**：訪客用 `https://xxxx.cloudfront.net` 連線，網址列有鎖頭，不用自己申請憑證。
+- **加速**：圖片、CSS、JS 這類靜態檔會快取在離訪客最近的節點，不必每次都回到東京的主機。
+- **保護後端**：訪客只連得到 CloudFront，2.5 之後 ALB 只接受 CloudFront 送來的流量。
+
+```
+訪客 ──HTTPS──► CloudFront 節點 ──HTTP 80 + 暗號標頭──► wp-alb ──► wp-web-1
+                 │
+                 ├─ /wp-content/*、/wp-includes/*：快取（圖片、CSS、JS）
+                 └─ 其他網址：不快取，每次都轉給 WordPress（登入、後台、留言）
+```
+
+> 名詞：
+> - **Distribution（分發）**：一組 CloudFront 設定，建立後會得到一個 `dxxxx.cloudfront.net` 網址。
+> - **Origin（來源）**：CloudFront 去哪裡拿內容，這裡是 `wp-alb`。
+> - **Behavior（行為）**：依網址路徑決定要不要快取、允許哪些 HTTP 方法。
+
+#### 2.4-1 產生「暗號」`<ORIGIN_SECRET>`
+
+CloudFront 轉給 ALB 的每個請求，都會帶上一個秘密標頭 `X-Origin-Verify`。2.5 會設定成只有帶著正確暗號的請求才放行，別人就無法繞過 CloudFront 直接打 ALB。
+
+在 CloudShell 執行：
 
 ```bash
 aws secretsmanager get-random-password --password-length 32 --exclude-punctuation \
   --query RandomPassword --output text
 ```
 
-記下輸出，以下稱 `<ORIGIN_SECRET>`。
+會印出一串 32 個英數字。複製下來，記到「準備 5：數值記錄表」，以下稱 `<ORIGIN_SECRET>`。
 
-1. 搜尋 **CloudFront → Create distribution**。若出現定價方案（Pricing plan）選擇，選 **Pay-as-you-go**：它仍享有每月 1 TB 的永久免費額度，而且不像月費方案那樣，刪除前要先取消訂閱，清除最單純。
-2. **Origin**：
-   - Origin domain：貼上 ALB 的 DNS name
-   - Protocol：**HTTP only**、Port 80
-   - **Add custom header**：Header name `X-Origin-Verify`、Value `<ORIGIN_SECRET>`
-3. **Default cache behavior**：
-   - Viewer protocol policy：**Redirect HTTP to HTTPS**
-   - Allowed HTTP methods：**GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE**（WordPress 登入、留言需要 POST）
-   - Cache policy：**CachingDisabled**
-   - Origin request policy：**AllViewer**（把網址主機名稱、Cookie 等原封不動轉給 WordPress，避免登入失敗或重新導向迴圈）
-4. Web Application Firewall (WAF)：選 **Do not enable security protections**（WAF 每月約 $5 起，練習先不開，正式網站建議開啟）。
-5. Settings：Price class 可選 **Use North America, Europe, Asia, Middle East, and Africa**。
-6. **Create distribution**。
+#### 2.4-2 選擇定價方案（新版主控台）
 
-建立後新增兩個「靜態檔案快取」行為：進入 distribution → **Behaviors → Create behavior**，分別建立：
+2025 年 11 月起，CloudFront 主控台建立 distribution 時，會先要你選**月費方案（flat-rate pricing plan）**。目前列出的方案是：
 
-| Path pattern | Origin | Viewer protocol | Cache policy | Origin request policy |
-|---|---|---|---|---|
-| `/wp-content/*` | ALB | Redirect HTTP to HTTPS | **CachingOptimized** | 無 |
-| `/wp-includes/*` | ALB | Redirect HTTP to HTTPS | **CachingOptimized** | 無 |
+| 方案 | 月費 | 每月包含 | 適合 |
+|---|---|---|---|
+| **Free** | **$0** | 100 萬次請求、100 GB 流量；內含 WAF（5 條規則）、免費憑證；最多 5 個 Behavior | ✅ **本指南練習用這個** |
+| Pro | $15 | 1,000 萬次請求、50 TB；WAF 25 條規則、WordPress 專用防護 | 正式小網站 |
+| Business | $200 | 1.25 億次請求、50 TB | 中大型網站 |
+| Premium | $1,000 起 | 5 億次請求起 | 大型網站 |
 
-記下 distribution 的網域，例如 `d1234abcd.cloudfront.net`，以下稱 `<CF_DOMAIN>`。部署約 5–10 分鐘（Last modified 從 Deploying 變成日期）。
+> 💡 **主控台已經不一定看得到 Pay-as-you-go（依用量計費）。** 舊版指南寫「選 Pay-as-you-go」是依舊畫面寫的。如果你的畫面只有 Free／Pro／Business／Premium，就選 **Free**。想用 Pay-as-you-go，請改用下面的**方法 B（CLI）**，用指令建立的 distribution 預設就是 Pay-as-you-go。
 
-✅ **驗證**：瀏覽器打開 `https://<CF_DOMAIN>/healthz` 顯示 `ok`，網址列有鎖頭。
+**Free 方案要知道的四件事：**
+
+1. **不會有超額費用**：超過 100 GB 或 100 萬次請求也不會多收錢，只會收到 Email 通知（50%、80%、100%），長期超過時 AWS 可能降低傳送速度。練習用量遠低於這個額度。
+2. **WAF 一定要開**：Free 方案內含 WAF，建立時會自動套用，**不另外收費**，不能關掉。
+3. **刪除前要先取消方案**：清除資源時，要先在 distribution 取消 Free 方案（立即生效），才能 Disable 和 Delete。見「清除所有資源」。
+4. **每個帳號最多 3 個 Free 方案**，一個方案對應一個 distribution。
+
+> ⚠️ 如果選 Free 時出現帳號不符合資格的訊息（例如帳號還在新版 AWS Free Tier 的免費方案期間），不要選付費方案，改用**方法 B（CLI）**建立 Pay-as-you-go 的 distribution。Pay-as-you-go 每月有 1 TB 流量、1,000 萬次請求的永久免費額度，練習一樣是 $0。
+
+下面兩種方法**擇一**即可。
+
+#### 方法 A：主控台（Free 方案）
+
+> 主控台精靈的頁面名稱可能隨 AWS 改版略有不同。遇到對不上的畫面，截圖貼到討論串，我再補上。精靈裡沒設好的項目，建立後都可以在「2.4-3 建立後檢查與補設定」改回來。
+
+1. 主控台上方搜尋 **CloudFront** → 左側 **Distributions** → **Create distribution**。
+
+**Choose a plan（選擇方案）**
+
+2. 選 **Free** → **Next**。
+
+**Get started（開始）**
+
+3. **Distribution name**：`wp-cf`（會變成 `Name` 標籤）。
+4. **Distribution type**：選 **Single website or app** → **Next**。
+5. **Domain**（自訂網域）：選 **Skip the domain setup for now** / 不設定 → **Next**。先用 CloudFront 給的網址，自己的網域之後再加。
+
+**Specify origin（指定來源）**
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Origin type** | **Elastic Load Balancer** | 來源是 ALB |
+| **Origin**（或 Load balancer） | 選 **`wp-alb`**（顯示為 `wp-alb-xxxx.ap-northeast-1.elb.amazonaws.com`） | 下拉選單找不到時，直接貼上 ALB 的 DNS name |
+| **Settings** | ⚠️ 選 **Customize origin settings**（自訂） | **不要**用 *Use recommended origin settings*，推薦設定是 **HTTPS only**，但我們的 ALB 只有 HTTP 80，會造成 **502 錯誤** |
+
+選 **Customize origin settings** 之後，下方會出現更多欄位：
+
+| 欄位 | 設定 |
+|---|---|
+| **Protocol** | ⚠️ **HTTP only** |
+| **HTTP port** | `80` |
+| **Add custom header** → **Add header** | Header name：`X-Origin-Verify`；Value：貼上 `<ORIGIN_SECRET>` |
+| **Origin Shield** | No（預設） |
+
+**Cache settings（快取設定）**，如果在這一頁出現：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Viewer protocol policy** | **Redirect HTTP to HTTPS** | 訪客用 http 連會自動轉成 https |
+| **Allowed HTTP methods** | **GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE** | WordPress 登入、發文、留言要用 POST |
+| **Caching** / **Cache policy** | **Do not cache by default** / **CachingDisabled** | 預設不快取，避免後台頁面被快取（靜態檔的快取在 2.4-3 另外加） |
+| **Origin request policy** | **AllViewer** | 把網址主機名稱、Cookie 原封不動轉給 WordPress，避免登入失敗或轉址迴圈 |
+
+按 **Next**。
+
+**Enable security protections（WAF）**
+
+6. Free 方案會自動啟用 WAF（內含、不另外收費），保持預設 → **Next**。
+
+**Review and create（確認並建立）**
+
+7. 確認 Origin 是 `wp-alb`、Protocol 是 **HTTP only**、有 `X-Origin-Verify` 標頭 → **Create distribution**。
+8. 畫面會進入 `wp-cf` 的詳細頁。**Details** 中的 **Distribution domain name**（類似 `d1234abcd.cloudfront.net`）記到「準備 5：數值記錄表」，以下稱 `<CF_DOMAIN>`。
+9. **Last modified** 一開始是 **Deploying**，約 **5–10 分鐘**後變成日期時間，就是部署完成。
+
+#### 方法 B：CloudShell 指令（Pay-as-you-go）
+
+用指令建立的 distribution 不會套用月費方案，就是 Pay-as-you-go。這段會一次建好來源、暗號標頭、預設行為和兩個靜態檔快取行為（2.4-3 的步驟 1 就不用再做）。
+
+先把 `<ORIGIN_SECRET>` 換成 2.4-1 的暗號，再整段貼上：
+
+```bash
+ORIGIN_SECRET='<ORIGIN_SECRET>'     # ← 換成 2.4-1 產生的暗號（保留單引號）
+case "$ORIGIN_SECRET" in *"<"*|"") SECRET_OK=no; echo "❌ 還沒把 <ORIGIN_SECRET> 換成暗號，這次不會建立，請修改第一行後重貼";; *) SECRET_OK=yes;; esac
+ALB_DNS=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].DNSName" --output text)
+echo "ALB：$ALB_DNS"
+
+# AWS 內建（managed）政策的固定 ID
+CACHING_DISABLED=4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+CACHING_OPTIMIZED=658327ea-f89d-4fab-a63d-7e88639e58f6
+ALL_VIEWER=216adef6-5c7f-47e4-b989-5492eafa07d3
+
+STATIC_BEHAVIOR() {  # 產生「靜態檔快取」行為的設定
+cat <<EOF
+{ "PathPattern": "$1", "TargetOriginId": "wp-alb",
+  "ViewerProtocolPolicy": "redirect-to-https", "Compress": true,
+  "AllowedMethods": {"Quantity": 2, "Items": ["GET","HEAD"],
+    "CachedMethods": {"Quantity": 2, "Items": ["GET","HEAD"]}},
+  "CachePolicyId": "$CACHING_OPTIMIZED" }
+EOF
+}
+
+cat > cf-config.json <<EOF
+{
+  "CallerReference": "wp-cf-$(date +%s)",
+  "Comment": "wp-cf",
+  "Enabled": true,
+  "PriceClass": "PriceClass_200",
+  "HttpVersion": "http2and3",
+  "Origins": {"Quantity": 1, "Items": [{
+    "Id": "wp-alb", "DomainName": "$ALB_DNS",
+    "CustomOriginConfig": {"HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
+      "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}},
+    "CustomHeaders": {"Quantity": 1, "Items": [{"HeaderName": "X-Origin-Verify", "HeaderValue": "$ORIGIN_SECRET"}]}
+  }]},
+  "DefaultCacheBehavior": {
+    "TargetOriginId": "wp-alb", "ViewerProtocolPolicy": "redirect-to-https", "Compress": true,
+    "AllowedMethods": {"Quantity": 7, "Items": ["GET","HEAD","OPTIONS","PUT","POST","PATCH","DELETE"],
+      "CachedMethods": {"Quantity": 2, "Items": ["GET","HEAD"]}},
+    "CachePolicyId": "$CACHING_DISABLED", "OriginRequestPolicyId": "$ALL_VIEWER"
+  },
+  "CacheBehaviors": {"Quantity": 2, "Items": [
+    $(STATIC_BEHAVIOR "/wp-content/*"),
+    $(STATIC_BEHAVIOR "/wp-includes/*")
+  ]}
+}
+EOF
+if [ "$SECRET_OK" = yes ] && python3 -m json.tool cf-config.json > /dev/null; then
+  echo "✅ 設定檔格式正確，開始建立"
+  aws cloudfront create-distribution-with-tags \
+    --distribution-config-with-tags "{\"DistributionConfig\": $(cat cf-config.json), \"Tags\": {\"Items\": [{\"Key\": \"Name\", \"Value\": \"wp-cf\"}]}}" \
+    --query "Distribution.{Id:Id, Domain:DomainName, Status:Status}" --output table
+else
+  echo "❌ 沒有建立：暗號沒換掉或設定檔格式錯誤"
+fi
+```
+
+- 開頭的 `ALB：` 必須印出 `wp-alb-...elb.amazonaws.com`，是空的就代表 ALB 名稱不對。
+- 最後的表格會列出 **Domain**（`dxxxx.cloudfront.net`）和 **Status: InProgress**。把 Domain 記到「準備 5：數值記錄表」，以下稱 `<CF_DOMAIN>`。
+- 約 **5–10 分鐘**後 Status 變成 `Deployed`。
+- `PriceClass_200` 代表使用北美、歐洲、亞洲、中東、非洲的節點（不含南美、澳洲），比全球節點便宜一點。
+- Pay-as-you-go 沒有內含 WAF，這裡也沒有開（WAF 每月約 $5 起）。正式網站建議開啟。
+
+#### 2.4-3 建立後檢查與補設定（方法 A 必做）
+
+**步驟 1：新增兩個「靜態檔快取」行為**（方法 B 已經建好，可以跳過）
+
+進入 `wp-cf` → **Behaviors** 分頁 → **Create behavior**，建立兩次：
+
+| 欄位 | 第一個 | 第二個 |
+|---|---|---|
+| **Path pattern** | `/wp-content/*` | `/wp-includes/*` |
+| **Origin and origin groups** | `wp-alb` 那一個 | 同左 |
+| **Viewer protocol policy** | **Redirect HTTP to HTTPS** | 同左 |
+| **Allowed HTTP methods** | **GET, HEAD** | 同左 |
+| **Cache key and origin requests** | **Cache policy and origin request policy (recommended)** | 同左 |
+| **Cache policy** | **CachingOptimized** | 同左 |
+| **Origin request policy** | 不選（No origin request policy） | 同左 |
+
+每次按 **Create behavior** 存檔。完成後 Behaviors 分頁會有 3 列：`/wp-content/*`、`/wp-includes/*`、`Default (*)`。
+
+> 為什麼這兩個路徑可以快取：`/wp-content/` 放上傳的圖片、佈景主題、外掛的 CSS／JS；`/wp-includes/` 放 WordPress 內建的 JS／CSS。它們不會因為登入的人不同而改變，快取起來最划算。
+
+**步驟 2：確認來源設定**（精靈裡沒看到的欄位在這裡補）
+
+**Origins** 分頁 → 勾選 `wp-alb` 那一列 → **Edit**：
+
+- **Protocol**：**HTTP only**，HTTP port `80`。
+- **Add custom header**：有 `X-Origin-Verify`，值是 `<ORIGIN_SECRET>`。沒有的話按 **Add header** 補上。
+- 有改的話按 **Save changes**。
+
+**步驟 3：確認預設行為**
+
+**Behaviors** 分頁 → 勾選 **Default (\*)** → **Edit**：
+
+- **Viewer protocol policy**：**Redirect HTTP to HTTPS**
+- **Allowed HTTP methods**：**GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE**
+- **Cache policy**：**CachingDisabled**
+- **Origin request policy**：**AllViewer**
+
+有改的話按 **Save changes**。每次存檔後，**Last modified** 會回到 *Deploying*，等它變回日期時間。
+
+✅ **驗證 2.4**（CloudShell）：部署完成後，整段貼上：
+
+```bash
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CF_DOMAIN=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.DomainName" --output text)
+echo "Distribution：$CF_ID    網址：https://$CF_DOMAIN"
+
+ST=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.Status" --output text)
+[ "$ST" = "Deployed" ] && echo "✅ 狀態：Deployed" || echo "⏳ 狀態：$ST（還在部署，等幾分鐘再跑一次）"
+
+aws cloudfront get-distribution-config --id $CF_ID --query "DistributionConfig" > cf-check.json
+python3 - <<'PY'
+import json
+c = json.load(open("cf-check.json"))
+o = c["Origins"]["Items"][0]
+d = c["DefaultCacheBehavior"]
+paths = [b["PathPattern"] for b in c.get("CacheBehaviors", {}).get("Items", [])]
+hdrs = [h["HeaderName"] for h in o.get("CustomHeaders", {}).get("Items", [])]
+def chk(ok, good, bad): print(("✅ " + good) if ok else ("❌ " + bad))
+chk(o.get("CustomOriginConfig", {}).get("OriginProtocolPolicy") == "http-only",
+    "來源 Protocol：HTTP only", "來源 Protocol 不是 HTTP only（會造成 502），到 Origins → Edit 修改")
+chk("X-Origin-Verify" in hdrs, "有 X-Origin-Verify 暗號標頭", "缺少 X-Origin-Verify 標頭，到 Origins → Edit → Add header")
+chk(d["ViewerProtocolPolicy"] == "redirect-to-https", "預設行為：Redirect HTTP to HTTPS", "預設行為的 Viewer protocol policy 不對")
+chk("POST" in d["AllowedMethods"]["Items"], "預設行為允許 POST（可以登入）", "預設行為沒有允許 POST，登入會失敗")
+chk(d.get("CachePolicyId") == "4135ea2d-6df8-44a3-9df3-4b5a84be39ad", "預設行為：CachingDisabled", "預設行為不是 CachingDisabled")
+chk(d.get("OriginRequestPolicyId") == "216adef6-5c7f-47e4-b989-5492eafa07d3", "預設行為：AllViewer", "預設行為的 Origin request policy 不是 AllViewer")
+chk("/wp-content/*" in paths and "/wp-includes/*" in paths, "有 /wp-content/* 和 /wp-includes/* 快取行為", "缺少靜態檔快取行為（目前：%s）" % paths)
+PY
+
+echo "--- 透過 CloudFront 測試 ---"
+H=$(curl -s -m 15 "https://$CF_DOMAIN/healthz")
+[ "$H" = "ok" ] && echo "✅ https://$CF_DOMAIN/healthz：ok" || echo "❌ /healthz 回應：$H"
+curl -s -m 15 -o /dev/null -w "http 自動轉 https：%{http_code} → %{redirect_url}\n" "http://$CF_DOMAIN/healthz"
+echo "=== 請把這個網址記到「準備 5：數值記錄表」：$CF_DOMAIN ==="
+```
+
+正確結果類似：
+
+```text
+Distribution：E1ABCDEFGHIJKL    網址：https://d1234abcd.cloudfront.net
+✅ 狀態：Deployed
+✅ 來源 Protocol：HTTP only
+✅ 有 X-Origin-Verify 暗號標頭
+✅ 預設行為：Redirect HTTP to HTTPS
+✅ 預設行為允許 POST（可以登入）
+✅ 預設行為：CachingDisabled
+✅ 預設行為：AllViewer
+✅ 有 /wp-content/* 和 /wp-includes/* 快取行為
+--- 透過 CloudFront 測試 ---
+✅ https://d1234abcd.cloudfront.net/healthz：ok
+http 自動轉 https：301 → https://d1234abcd.cloudfront.net/healthz
+=== 請把這個網址記到「準備 5：數值記錄表」：d1234abcd.cloudfront.net ===
+```
+
+也可以用瀏覽器打開 `https://<CF_DOMAIN>/healthz`，畫面顯示 `ok`，網址列有鎖頭。
+
+> 📌 現在用瀏覽器打開 `https://<CF_DOMAIN>/` 首頁，可能被導回 `http://<EIP>` 而打不開，或版面跑掉。這是因為 WordPress 記得的網址還是 EIP，**2.5 會改好**。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| `/healthz` 回應 **502 Bad Gateway** | 來源 Protocol 是 HTTPS only，但 ALB 只有 HTTP 80 | Origins → `wp-alb` → Edit → Protocol 改 **HTTP only** → Save，等部署完成 |
+| **504 Gateway Timeout** | CloudFront 連不到 ALB | 確認 `wp-alb-sg` 目前允許 HTTP 80 來自 `0.0.0.0/0`（2.5 才會收緊）；用 2.3 驗證③確認 ALB 本身正常 |
+| **403** 且頁面提到 *Request blocked* | WAF 擋下了請求 | Security 分頁看 WAF 紀錄；練習時可先把被擋的規則改成 Count |
+| 驗證的 `CF_ID` 是 `None` | 找不到來源是 `wp-alb` 的 distribution | 主控台 Distributions 確認有沒有建立成功；Origin 要是 ALB 的 DNS name |
+| 方法 B 出現 `InvalidArgument` 或 JSON 錯誤 | `ORIGIN_SECRET` 沒換掉，或含有特殊字元 | 暗號只能用 2.4-1 產生的英數字，重新設定後再貼一次 |
+| ❌ 缺少靜態檔快取行為 | 方法 A 還沒做 2.4-3 步驟 1 | 照步驟 1 新增 |
 
 ### 2.5 讓 WordPress 改用 CloudFront 網址
 
@@ -3251,7 +3500,7 @@ rm -f /var/www/html/wp-content/mu-plugins/boom-test.php
 
 ### 刪除 Phase 2
 
-1. **CloudFront** → 選取 distribution → **Disable** → 等狀態變 Disabled（約 5–15 分鐘）→ **Delete**。若有用自己的網域，也到 **ACM（us-east-1）** 刪除憑證、到 DNS 刪除 CNAME。
+1. **CloudFront** → 選取 distribution `wp-cf`。⚠️ 如果用的是 **Free 方案**（方法 A），先進入 distribution → 找 **Pricing plan**／**Manage plan** → **Cancel plan**（Free 方案立即取消，不取消就無法刪除）。然後 **Disable** → 等狀態變 Disabled（約 5–15 分鐘）→ **Delete**。Free 方案自動建立的 WAF web ACL，到 **WAF & Shield → Web ACLs**（Global／CloudFront）一併刪除。若有用自己的網域，也到 **ACM（us-east-1）** 刪除憑證、到 DNS 刪除 CNAME。
 2. **Auto Scaling Groups** → 刪除 `wp-asg`（會自動終止它的主機）。
 3. **Load Balancers** → 刪除 `wp-alb`。
 4. **Target Groups** → 刪除 `wp-tg`。
@@ -3663,6 +3912,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.4（10/28 實作） | 新版主控台建立 distribution 時先選月費方案，畫面看不到 Pay-as-you-go，指南寫的選項對不上 | 改寫 2.4：方案比較表（建議 Free）與四個注意事項；方法 A 依新精靈逐頁說明，強調來源要改 HTTP only（推薦設定是 HTTPS only 會 502）；方法 B 用 CLI 建立 Pay-as-you-go；建立後檢查、一鍵驗證與排錯表；清除步驟加上先取消 Free 方案 |
 | 2.3 ④（10/27 補充、實作） | 收緊 `wp-web-sg` 只有一行說明；實作時直接改 Source 出現 *You may not specify a referenced group id for an existing IPv4 CIDR rule* | 改成主控台「刪掉舊規則、Add rule 新增」的步驟、先加後刪的 CLI 做法、驗證腳本（規則、ALB 通、EIP 不通）與排錯表；修正「做完 ④ 網站就無法瀏覽」的說法 |
 | 2.3 ③驗證（10/27 實作） | 網址只印在輸出最上方容易被捲走；實際首頁回應 200，不是 301 | 最後一行再印一次 ALB DNS name，並說明主控台哪裡複製；說明首頁 200 或 301 都正常 |
 | 2.3 ②③（10/27 補充） | 目標群組和 ALB 只有簡短說明 | 改成逐欄位設定表（含 Advanced health check）、CLI 做法、驗證腳本與 unhealthy 排錯表；說明 `unused` 狀態和首頁 301 轉址是正常的 |
