@@ -5127,3 +5127,86 @@ CloudShell 閒置或重新連線之後，前面設定的 `$ACCOUNT_ID`、`$ALB_D
 | 🔐 **2.5 還要再收緊一次** | `wp-alb-sg` 目前允許所有人連 HTTP 80，2.5 會改成只允許 CloudFront，並加上 `X-Origin-Verify` 秘密標頭 |
 | 💾 **確認每天的備份有在跑** | 明天早上到 S3 `wp-backup-<ACCOUNT_ID>/db/` 看有沒有新的備份檔（台灣時間 03:00 產生） |
 | 🔁 **Session Manager 不受防火牆影響** | 收緊 `wp-web-sg` 之後照樣登得進去，因為 Session Manager 是主機主動連出去 |
+
+---
+
+## 2026-10-28 實作紀錄：修改內容與學習到的經驗
+
+這一頁記錄 2026-10-28 照著 v3 指南實際操作 Phase 2（2.4–2.8）的過程：遇到的問題、指南因此做的修改、學到的經驗，以及接下來要注意的事項。
+
+### 一、今天的實作進度
+
+| 階段 | 結果 |
+|---|---|
+| 2.4 CloudFront `wp-cf` | ✅ 完成。主控台沒有出現方案選項，建立的是 Pay-as-you-go |
+| 2.5-1 WordPress 改用 CloudFront 網址 | ✅ 完成。第一次把 `<EIP>` 原樣貼上，網址沒有改到，改用新版指令後成功 |
+| 2.5-2 收緊 ALB（前綴清單＋暗號標頭） | ✅ 完成 |
+| 2.6 AMI `wp-web-ami-v1`、啟動範本 `wp-web-lt` | ✅ 完成。做之前先審核指南，補了 8 項遺漏 |
+| 2.7 Auto Scaling `wp-asg`、退役 `wp-web-1` | ✅ 完成 |
+| 2.8 告警改成觀察整個網站 | 進行中。主控台找不到 5XX 指標，改用 CLI 或 Source 分頁建立 |
+
+### 二、今天修改的內容
+
+| 章節 | 修改前的問題 | 修改內容 |
+|---|---|---|
+| 2.4 定價方案 | 寫「選 Pay-as-you-go」，但新版主控台只有月費方案，實際畫面又完全沒有方案選項 | 改成「有方案選項就選 Free，沒有就直接往下做」；加上方案比較、CLI 建立 Pay-as-you-go 的做法 |
+| 2.4 來源設定 | 沒提醒推薦設定是 HTTPS only | 強調要選 Customize origin settings、Protocol 改 HTTP only，否則 502 |
+| 2.4 驗證 | 只有用瀏覽器看 `/healthz` | 一鍵驗證 7 項設定、建立後檢查與排錯表 |
+| 2.5-1 | `OLD=http://<EIP>` 原樣貼上會出錯，變數變成空的 | EIP 改從主機中繼資料自動取得，只填 CloudFront 網域並自動檢查格式；`wp-config.php` 修改不會重複加入 |
+| 2.5-2 | 收緊 ALB 只有四行 | 說明兩道鎖與「先加規則、再改預設」的順序；主控台逐畫面步驟、CLI 自動讀取暗號、驗證與排錯 |
+| 2.5-2 步驟 3 | 改成前綴清單的步驟太簡略 | 拆成 3-1～3-3，解釋前綴清單、刪掉再新增、規則數量上限 |
+| 2.6 | 沒有做 AMI 前的檢查與驗證；`/healthz` 不檢查 EFS；舊網站檔案（含資料庫密碼）會進 AMI；網路介面欄位不完整 | 改寫成 2.6-1～2.6-6（依審核結果，經同意後修改） |
+| 2.6 硬碟大小 | 寫成 8 GiB | 改成 20 GiB（1.7 設定的大小），並說明不能改小 |
+| 2.7 Network | 沒提到 Availability Zone distribution、Additional capacity settings | 選 Balanced best effort、Capacity Reservation preference 保持 Default |
+| 2.7 進階選項與群組大小 | 沒提到 Instance maintenance policy；欄位放錯頁 | 依實際畫面分成 advanced options 頁和 group size and scaling 頁；選 Prioritize availability，Min 100%、Max 200% |
+| 2.7 退役舊主機 | 只有三行 | 退役前確認、三個步驟的原因、逐步操作、CLI、驗證、退役後注意事項 |
+| 2.8 | 告警步驟只有幾行 | 告警精靈逐欄位設定、CLI 一次完成、驗證與測試通知；補上找不到 5XX 指標時的兩種做法 |
+
+### 三、學習到的經驗
+
+**1. AWS 主控台改版很快，指南要以「實際畫面」為準**
+今天遇到四次畫面和指南不同：CloudFront 的方案選項（先是多了月費方案，實際畫面卻又沒有）、Auto Scaling 新增的 *Availability Zone distribution*、*Instance maintenance policy* 所在的頁面、CloudWatch 找不到指標。遇到對不上的畫面時，先看欄位的**用途**，再決定怎麼填；不確定就截圖詢問，不要猜。
+
+**2. 「推薦設定」不一定適合你的架構**
+CloudFront 對 ALB 來源的推薦設定是 **HTTPS only**，但我們的 ALB 只有 HTTP 80，照推薦設定會出現 502。選「推薦」或「預設」前，先確認它和自己的架構相符。
+
+**3. 終端機裡不能貼 `< >`**
+指南裡的 `<EIP>`、`<CF_DOMAIN>` 是「請換成你的值」的意思，不是指令的一部分。`<` 在 bash 是「從檔案讀入」，原樣貼上會出現 `syntax error near unexpected token 'newline'`，變數也會是空的。更好的做法是讓指令**自動取得**這些值（例如從主機中繼資料取得 EIP），或在指令開頭檢查值有沒有填對。
+
+**4. 看到 `Success` 不代表真的成功**
+2.5-1 第一次執行時出現 `Success: Value passed for 'home' option is unchanged.`，看起來成功，其實什麼都沒改（因為變數是空的）。要看**完整訊息**，並用驗證指令確認結果，例如直接查詢 `wp option get home`。
+
+**5. 防護要分層，而且要注意順序**
+收緊 ALB 用了兩道鎖：安全群組只允許 CloudFront 的 IP（擋掉直接連線），ALB 規則檢查暗號標頭（擋掉別人的 CloudFront）。設定時要**先加放行規則、再改預設為拒絕**，順序反了網站會中斷。
+
+**6. 主控台不能把 IP 規則直接改成前綴清單或安全群組**
+和 2.3 ④ 一樣，要刪掉舊規則、再新增一條，同一次 Save 一起生效。
+
+**7. 做 AMI 前，主機要「乾淨」而且「健康」**
+AMI 會把主機現在的樣子複製到每一台新主機。所以要先確認服務都設成開機自動啟動、EFS 正常、刪掉不需要的檔案（特別是含有密碼的舊設定檔）。建立 AMI 時的重開機，也正好測試了 fstab 自動掛載。
+
+**8. 健康檢查要檢查「真正會壞的地方」**
+原本的 `/healthz` 只代表 Nginx 活著，EFS 沒掛上時網站已經壞了，ALB 卻還判定健康。改成檢查 `wp-config.php` 存在，Auto Scaling 才能自動換掉壞掉的主機。
+
+**9. 只有 1 台主機時，換主機要「先開新的、再關舊的」**
+Instance maintenance policy 選 Prioritize availability，Max healthy percentage 要改成 200%，否則 1 台的群組沒有空間先開新主機，換主機時網站會中斷。
+
+**10. 告警不能綁單一主機**
+Auto Scaling 的主機會被替換、ID 會變。告警要觀察 ALB（網站錯誤）或整個 Auto Scaling 群組（平均 CPU）。另外，CloudWatch 只列出**有資料的指標**，沒發生過 5xx 就找不到 `HTTPCode_Target_5XX_Count`，這時用 CLI 或 Source 分頁直接指定指標名稱。
+
+**11. 先審核、再動手**
+2.6 在操作前先請 Claude 審核，找出 8 項遺漏（其中兩項如果沒發現，之後會很難除錯：健康檢查抓不到 EFS 問題、密碼被打包進 AMI）。重要步驟動手前先檢查一遍，比事後除錯省時間。
+
+### 四、接下來要注意的事項
+
+| 注意事項 | 說明 |
+|---|---|
+| ✅ **完成 2.8 後跑「驗證 2.8」** | `wp-5xx-high`、`wp-asg-cpu-high` 都要通知 `wp-alerts`，舊的 `wp-cpu-high` 要刪除 |
+| 🧪 **做 2.7 的自我修復測試** | 手動 Terminate `wp-web-asg`，確認 ASG 自動開新主機、網站幾分鐘內恢復 |
+| 📋 **做 Phase 2 完成檢查表** | 網址有鎖頭可登入、直接連 ALB 被擋、ASG 會自動補主機、S3 有每日備份、EIP 已釋放、`wp-5xx-high` 為 OK |
+| 🔑 **登入主機要找 `wp-web-asg`** | `wp-web-1` 已刪除。ASG 的主機 ID 會變，每次都用名稱找；前面寫 `wp-web-1` 的檢查指令不再適用 |
+| 🔄 **之後更新主機要做新版 AMI** | 只改正在執行的主機沒有用，新主機還是舊的。流程見 2.6-6（新 AMI → 範本新版本 → Instance refresh） |
+| 💰 **目前持續計費的資源** | ALB（約 $20–25／月）、RDS、ASG 主機與公有 IP（每台約 $3.6／月）、EFS、AMI 快照。暫時不用時照「清除所有資源」刪除 |
+| 🗑️ **清除時 CloudFront 的順序** | 如果用的是 Free 方案，要先取消方案才能刪除；我們是 Pay-as-you-go，直接 Disable → Delete |
+| 🔐 **暗號 `<ORIGIN_SECRET>` 要保密** | 它是 ALB 第 2 道鎖的鑰匙。外洩時要同時更新 CloudFront 的標頭和 ALB 規則 |
+| ➡️ **下一步是 Phase 3** | AI Agent 會用標籤 `Role=wordpress` 找主機，2.6 的啟動範本已經加上這個標籤 |
