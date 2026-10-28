@@ -3663,10 +3663,157 @@ PY
 
 等 3–5 分鐘，`wp-tg` 的 Targets 會出現一台新主機並變 **healthy**。
 
-**退役舊主機**：
-1. **Target Groups → wp-tg → Targets** → 勾選 `wp-web-1` → **Deregister**。
-2. **EC2 → Instances** → `wp-web-1` → **Instance state → Terminate**。
-3. **EC2 → Elastic IPs** → 選取那個 IP → **Actions → Disassociate**，再 **Actions → Release Elastic IP addresses**（沒釋放會持續收費）。
+#### 退役舊主機 `wp-web-1`
+
+**為什麼需要**：`wp-web-1` 是 Phase 1 手動建立的主機，**不屬於 Auto Scaling 管理**。它壞了沒有人會補，而且它和 ASG 的主機同時在 `wp-tg` 裡，等於多付一台主機和一個 Elastic IP 的錢。ASG 的主機正常服務後，就可以把它退役。
+
+```
+退役前：ALB ─► wp-tg ─┬─► wp-web-1（手動建立，壞了不會自動補）＋ Elastic IP
+                      └─► wp-web-asg（ASG 管理，壞了自動補）
+退役後：ALB ─► wp-tg ───► wp-web-asg（只剩 ASG 管理的主機）
+```
+
+退役分三步，**順序不要顛倒**：
+
+| 步驟 | 做什麼 | 為什麼 |
+|---|---|---|
+| 1. Deregister | 把 `wp-web-1` 從 `wp-tg` 移出 | ALB 不再送**新**請求給它，正在處理中的請求可以做完（優雅下線），訪客不會看到錯誤 |
+| 2. Terminate | 刪除 `wp-web-1` 主機 | 停止主機和硬碟的費用 |
+| 3. Release EIP | 釋放 Elastic IP | 沒有綁在主機上的 Elastic IP **每小時照樣收費**，一定要釋放 |
+
+> 💡 **不會遺失資料**：網站檔案在 EFS、資料庫在 RDS、備份在 S3，`wp-web-1` 的硬碟上已經沒有需要保留的東西。主機的設定也都已經拍進 2.6 的 AMI。
+
+**開始前先確認**（CloudShell，整段貼上）：
+
+```bash
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+echo "--- wp-tg 的主機 ---"
+for T in $(aws elbv2 describe-target-health --target-group-arn $TG_ARN --query "TargetHealthDescriptions[].Target.Id" --output text); do
+  N=$(aws ec2 describe-instances --instance-ids $T --query "Reservations[0].Instances[0].Tags[?Key=='Name'].Value | [0]" --output text)
+  S=$(aws elbv2 describe-target-health --target-group-arn $TG_ARN --targets Id=$T --query "TargetHealthDescriptions[0].TargetHealth.State" --output text)
+  echo "$T  $N  $S"
+done
+ASG_OK=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names wp-asg \
+  --query "length(AutoScalingGroups[0].Instances[?HealthStatus=='Healthy' && LifecycleState=='InService'])" --output text)
+[ "$ASG_OK" -ge 1 ] 2>/dev/null && echo "✅ wp-asg 有 $ASG_OK 台健康的主機" || echo "❌ wp-asg 沒有健康的主機，先不要退役 wp-web-1"
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CF_DOMAIN=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.DomainName" --output text)
+[ "$(curl -s -m 15 https://$CF_DOMAIN/healthz)" = "ok" ] && echo "✅ 網站正常（https://$CF_DOMAIN）" || echo "❌ 網站不正常，先不要退役"
+```
+
+正確結果類似：
+
+```text
+--- wp-tg 的主機 ---
+i-0aaa1111bbbb22222  wp-web-1    healthy
+i-0ccc3333dddd44444  wp-web-asg  healthy
+✅ wp-asg 有 1 台健康的主機
+✅ 網站正常（https://d1234abcd.cloudfront.net）
+```
+
+**`wp-web-asg` 必須是 `healthy`**，三項都是 ✅ 才往下做。如果 `wp-web-asg` 不是 healthy，先看 2.7 的排錯，否則退役 `wp-web-1` 後網站會停擺。
+
+**方法 A：主控台**
+
+**步驟 1：從目標群組移出（Deregister）**
+
+1. **EC2** → 左側 **Load Balancing → Target Groups** → 點 **`wp-tg`**。
+2. 點 **Targets** 分頁。清單中會有兩台主機，看 **Name** 欄找到 **`wp-web-1`**。（沒有 Name 欄時，對照上面確認步驟印出的主機 ID。）
+3. 只勾選 **`wp-web-1`** 那一列。⚠️ 不要勾到 `wp-web-asg`。
+4. 按右上 **Deregister** → 確認。
+5. `wp-web-1` 的 **Health status** 會變成 **Draining**。這是 ALB 在等它把正在處理的請求做完，**最多 300 秒（5 分鐘）**，之後就會從清單消失。
+   - 不想等的話，可以直接做步驟 2，對練習網站沒有影響。
+
+**步驟 2：刪除主機（Terminate）**
+
+1. **EC2 → Instances**。
+2. 只勾選 **Name 是 `wp-web-1`** 的那一台。⚠️ **再確認一次名稱**，不要勾到 `wp-web-asg`（刪掉的話 ASG 會再開一台，但網站會中斷幾分鐘）。
+3. 右上 **Instance state → Terminate (delete) instance** → 確認視窗按 **Terminate (delete)**。
+4. **Instance state** 會從 *Shutting-down* 變成 **Terminated**（約 1–2 分鐘）。Terminated 的主機會在清單上顯示約一小時後自動消失，不會收費。
+   - 主機的 20 GiB 硬碟會**一起刪除**（1.7 建立時預設 Delete on termination）。
+   - 如果出現 *termination protection* 的錯誤：**Actions → Instance settings → Change termination protection** → 取消勾選 **Enable** → Save，再 Terminate 一次。
+
+**步驟 3：釋放 Elastic IP**
+
+1. **EC2** → 左側 **Network & Security → Elastic IPs**。
+2. 找到 1.8 建立的那個 IP。主機刪除後，它會**自動解除關聯**，**Associated instance ID** 欄位會是空的（`-`）。
+   - 如果還顯示 `wp-web-1` 的主機 ID：先勾選它 → **Actions → Disassociate Elastic IP address** → **Disassociate**。
+3. 勾選這個 IP → **Actions → Release Elastic IP addresses** → **Release**。
+4. 這個 IP 會從清單消失。⚠️ 釋放之後**無法取回**同一個 IP，不過我們已經改用 CloudFront 網址，不再需要它。
+
+> ⚠️ **為什麼一定要釋放**：AWS 對每個公有 IPv4 位址收費（約每月 $3.6），不管有沒有綁在主機上。主機刪掉了、IP 還留著，就是白付錢，而且很容易忘記。
+
+**方法 B：CloudShell 指令**
+
+```bash
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+IID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=wp-web-1" "Name=instance-state-name,Values=running,stopped" \
+  --query "Reservations[0].Instances[0].InstanceId" --output text)
+ALLOC=$(aws ec2 describe-addresses --filters Name=instance-id,Values=$IID --query "Addresses[0].AllocationId" --output text)
+echo "wp-web-1：$IID    Elastic IP：$ALLOC"
+
+if [ "$IID" != "None" ]; then
+  # 1) 從目標群組移出，等它 draining 完成（最多 5 分鐘）
+  aws elbv2 deregister-targets --target-group-arn $TG_ARN --targets Id=$IID && echo "✅ 已移出 wp-tg，等待 draining…"
+  aws elbv2 wait target-deregistered --target-group-arn $TG_ARN --targets Id=$IID && echo "✅ draining 完成"
+  # 2) 刪除主機
+  aws ec2 terminate-instances --instance-ids $IID --query "TerminatingInstances[0].CurrentState.Name" --output text
+  aws ec2 wait instance-terminated --instance-ids $IID && echo "✅ wp-web-1 已刪除"
+  # 3) 釋放 Elastic IP
+  [ "$ALLOC" != "None" ] && aws ec2 release-address --allocation-id $ALLOC && echo "✅ 已釋放 Elastic IP"
+else
+  echo "找不到執行中的 wp-web-1（可能已經刪除），直接做驗證"
+fi
+```
+
+- 第一行必須印出 `i-` 開頭的主機 ID，以及 `eipalloc-` 開頭的 Elastic IP ID。
+- 整段大約跑 **5–7 分鐘**（draining 最多 5 分鐘、刪除主機 1–2 分鐘），期間畫面會停住，是正常的。
+
+✅ **驗證退役**（CloudShell）：
+
+```bash
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+echo "--- wp-tg 的主機（應該只剩 wp-web-asg）---"
+for T in $(aws elbv2 describe-target-health --target-group-arn $TG_ARN --query "TargetHealthDescriptions[].Target.Id" --output text); do
+  N=$(aws ec2 describe-instances --instance-ids $T --query "Reservations[0].Instances[0].Tags[?Key=='Name'].Value | [0]" --output text)
+  S=$(aws elbv2 describe-target-health --target-group-arn $TG_ARN --targets Id=$T --query "TargetHealthDescriptions[0].TargetHealth.State" --output text)
+  echo "$T  $N  $S"
+done
+L=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=wp-web-1" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query "length(Reservations[].Instances[])" --output text)
+[ "$L" = "0" ] && echo "✅ wp-web-1 已刪除" || echo "❌ wp-web-1 還在"
+E=$(aws ec2 describe-addresses --query "length(Addresses)" --output text)
+[ "$E" = "0" ] && echo "✅ 沒有殘留的 Elastic IP" || echo "❌ 還有 $E 個 Elastic IP，請到 Elastic IPs 釋放"
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CF_DOMAIN=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.DomainName" --output text)
+[ "$(curl -s -m 15 https://$CF_DOMAIN/healthz)" = "ok" ] && echo "✅ 網站正常（https://$CF_DOMAIN）" || echo "❌ 網站不正常"
+```
+
+正確結果類似：
+
+```text
+--- wp-tg 的主機（應該只剩 wp-web-asg）---
+i-0ccc3333dddd44444  wp-web-asg  healthy
+✅ wp-web-1 已刪除
+✅ 沒有殘留的 Elastic IP
+✅ 網站正常（https://d1234abcd.cloudfront.net）
+```
+
+也用瀏覽器打開 `https://<CF_DOMAIN>` 和 `https://<CF_DOMAIN>/wp-admin`，確認網站和後台都正常。
+
+> 📌 **退役之後要注意：**
+> - **Session Manager 改連 `wp-web-asg`**：之後要登入主機，在 EC2 → Instances 選 `wp-web-asg` → Connect → Session Manager。ASG 的主機可能被替換，主機 ID 會變，**每次都用名稱找**。
+> - **前面指南裡寫 `wp-web-1` 的檢查指令**（例如 1.9、2.3 ④）已經不適用，不用再跑。
+> - **`wp-cpu-high` 告警**會變成 *Insufficient data*，因為它觀察的主機不在了。2.8 會改成觀察整個 Auto Scaling 群組。
+> - **每日備份不受影響**：ASG 的主機是用 2.6 的 AMI 開的，已經有備份排程，檔名會變成新主機的名稱。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| Deregister 後一直是 *Draining* | 正在等請求做完，最多 300 秒 | 等 5 分鐘；或直接 Terminate，不影響 |
+| 退役後網站顯示 **503** | `wp-tg` 沒有健康的主機（`wp-web-asg` 不是 healthy） | 看 `wp-web-asg` 的健康狀態和原因（2.3 ③ 排錯表）；ASG 會自動補主機，等 5 分鐘再看 |
+| 誤刪了 `wp-web-asg` | 勾錯主機 | 不用處理，ASG 會在幾分鐘內自動開一台新的（這也是 2.7 驗證要測的自我修復） |
+| Release 時出現 *address is in use* | IP 還綁在主機上 | 先 **Disassociate**，再 Release |
+| 驗證顯示還有 Elastic IP | 沒有釋放，或建立過不只一個 | Elastic IPs 頁面逐一 Release（確認沒有綁在需要的主機上） |
 
 ✅ **驗證（自我修復測試）**：
 1. `https://<CF_DOMAIN>` 正常。
@@ -4627,6 +4774,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.7 退役舊主機（10/28 補充） | 只有三行，沒有說明順序、等待時間與風險 | 加上退役前確認、三個步驟的原因、主控台逐步操作（Draining、勾錯主機、termination protection、EIP 自動解除關聯）、CLI 做法、驗證、退役後注意事項與排錯表 |
 | 2.7 進階選項（10/28 實作） | 沒有提到 Instance maintenance policy 等新欄位 | 改成欄位表：Instance maintenance policy 選 Prioritize availability（Min 100%、Max 200%），並說明 VPC Lattice、ARC zonal shift、健康檢查與寬限期；依實際畫面把 Instance maintenance policy 與 Additional settings 移到 Group size and scaling 頁 |
 | 2.7 Network（10/28 實作） | 新版主控台多了 Availability Zone distribution 和 Additional capacity settings，指南沒有提到 | 改成欄位表：選 Balanced best effort、Capacity Reservation preference 保持 Default，並說明原因 |
 | 2.6 硬碟大小（10/28） | AMI 和啟動範本寫成 8 GiB，但 1.7 建立主機時設定的是 20 GiB | 改成 20 GiB，說明啟動範本不能改小，修正快照費用說明 |
