@@ -3866,7 +3866,9 @@ i-0ccc3333dddd44444  wp-web-asg  healthy
 3. 在 **Browse** 分頁依序點：**ApplicationELB** → **Per AppELB Metrics**。
 4. 上方搜尋框輸入 `5XX`，在清單中找到：**LoadBalancer** 欄是 `app/wp-alb/xxxxxxxx`、**Metric name** 是 **`HTTPCode_Target_5XX_Count`** 的那一列 → 勾選 → 按右下 **Select metric**。
    - ⚠️ 不要選成 `HTTPCode_ELB_5XX_Count`。那是 ALB 自己產生的錯誤（例如沒有健康的主機），`Target` 才是主機回的錯誤。
-   - 找不到這個指標：代表主機還沒回過任何 5xx，CloudWatch 沒有資料就不會列出。改用下面的**方法 B**，不受影響。
+   - **找不到這個指標是正常的**：代表主機還沒回過任何 5xx 錯誤，CloudWatch 沒有資料就不會列出。兩種解法擇一：
+     - **改用下面的方法 B（CloudShell）**，最簡單。
+     - **在主控台改指標名稱**：同一個清單裡改勾 `wp-alb` 的 **`RequestCount`** → 上方點 **Source** 分頁，會看到類似 `[ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "app/wp-alb/xxxx" ]` 的內容 → 把 `RequestCount` 改成 `HTTPCode_Target_5XX_Count`（保留前後的雙引號）→ 按 **Update** → **Select metric**。
 5. **Metric** 區塊：
 
 | 欄位 | 設定 | 說明 |
