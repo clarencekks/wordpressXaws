@@ -2987,16 +2987,246 @@ php -l wp-config.php
 
 #### 2.5-2 收緊 ALB，只接受 CloudFront
 
-1. **EC2 → Load Balancers → wp-alb → Listeners → HTTP:80 → Manage rules**（或 **View/edit rules**）。
-2. 新增規則：Condition **HTTP header** `X-Origin-Verify` 等於 `<ORIGIN_SECRET>` → Action **Forward to `wp-tg`**，Priority `1`。
-3. 把 **Default action** 改成 **Return fixed response**：狀態碼 `403`、內容 `Forbidden`。
-4. 編輯 `wp-alb-sg` 的 inbound：刪掉 `0.0.0.0/0` 那條，新增 HTTP 80、Source 選 **Prefix lists → `com.amazonaws.global.cloudfront.origin-facing`**（AWS 維護的 CloudFront 來源 IP 清單）。
+**為什麼需要**：到目前為止，任何人只要知道 ALB 的網址（`wp-alb-xxxx.elb.amazonaws.com`），就能**繞過 CloudFront** 直接連進網站。這樣 HTTPS、快取、WAF 都會被跳過。這一步加上**兩道鎖**：
 
-✅ **驗證**：
-- `https://<CF_DOMAIN>` 正常顯示網站、`https://<CF_DOMAIN>/wp-admin` 可登入，網址一直維持 https。
-- CloudShell 中 `curl -s -o /dev/null -w "%{http_code}\n" http://<ALB的DNS>/` 回傳 `403` 或連線逾時（代表無法繞過 CloudFront）。
+```
+                              第 1 道鎖：安全群組 wp-alb-sg        第 2 道鎖：ALB 監聽器規則
+                              （只允許 CloudFront 的 IP）          （要帶正確暗號）
+訪客 ─► CloudFront ─HTTP 80 + X-Origin-Verify: 暗號─►  ✅ 通過  ─►  ✅ 暗號正確 → 轉給 wp-tg
+駭客 ──────────────────────直接連 ALB──────────────►  ❌ 擋下（連線逾時）
+駭客 ─► 自己的 CloudFront ─（沒有你的暗號）────────►  ✅ 通過  ─►  ❌ 回應 403 Forbidden
+```
 
-> 有自己的網域？到 **ACM（憑證管理）切到 us-east-1 區域** 申請憑證，在 CloudFront 的 Alternate domain name 填上網域並選擇憑證，再到 DNS 設定 CNAME 指向 `<CF_DOMAIN>`，最後重做上面「換網址」的三個 `wp` 指令。
+- **第 1 道鎖（安全群組）**：只允許 AWS 公布的 CloudFront IP 範圍連進來。AWS 把這些 IP 整理成一份**受管前綴清單（managed prefix list）**，名稱是 `com.amazonaws.global.cloudfront.origin-facing`，IP 有變動時 AWS 會自動更新。
+- **第 2 道鎖（暗號）**：別人也可以建立自己的 CloudFront 來連你的 ALB，第 1 道鎖擋不住。所以 ALB 還要檢查 2.4 設定的 `X-Origin-Verify` 標頭，暗號正確才轉給主機，否則回應 403。
+
+> 名詞：
+> - **Listener rule（監聽器規則）**：ALB 收到請求後，依條件決定怎麼處理。規則依 **Priority（優先順序）**由小到大比對，第一個符合的就執行；都不符合時，執行 **Default（預設）規則**。
+> - **Fixed response（固定回應）**：ALB 不轉給主機，直接回一個固定的狀態碼和內容。
+
+**開始前先確認**：
+- 2.4 的驗證已經通過（`https://<CF_DOMAIN>/healthz` 回應 `ok`）。
+- 2.5-1 已經完成（`home` 是 CloudFront 網址）。
+- 準備好 `<ORIGIN_SECRET>`。忘記了的話，到 **CloudFront → `wp-cf` → Origins → 勾選 `wp-alb` → Edit → Add custom header** 查看。方法 B 會自動讀取，不用手動找。
+
+> ⚠️ **順序很重要：先加規則、再改預設動作。** 如果先把預設動作改成 403，在加上規則之前，所有訪客（包括 CloudFront）都會被擋。
+
+下面兩種方法**擇一**即可。
+
+**方法 A：主控台**
+
+**步驟 1：新增「暗號正確才轉發」的規則**
+
+1. 主控台搜尋 **EC2** → 左側 **Load Balancing → Load Balancers** → 點 **`wp-alb`**。
+2. 點 **Listeners and rules** 分頁 → 點藍色的 **HTTP:80** 連結，進入這個監聽器的頁面。
+3. 在 **Listener rules** 區塊，按 **Add rule**。
+4. **Step 1 – Add rule**：**Name** 填 `cloudfront-only` → **Next**。
+5. **Step 2 – Define rule conditions**：按 **Add condition**：
+
+| 欄位 | 設定 |
+|---|---|
+| **Rule condition types** | **HTTP header** |
+| **HTTP header name** | `X-Origin-Verify` |
+| **HTTP header value** | 貼上 `<ORIGIN_SECRET>`（前後不要有空白） |
+
+   按 **Confirm** → **Next**。
+
+6. **Step 3 – Define rule actions**：
+
+| 欄位 | 設定 |
+|---|---|
+| **Routing actions** | **Forward to target groups** |
+| **Target group** | **`wp-tg`** |
+
+   按 **Next**。
+
+7. **Step 4 – Set rule priority**：**Priority** 填 `1` → **Next**。
+8. **Step 5 – Review and create**：確認條件是 `Http header X-Origin-Verify is <暗號>`、動作是 `Forward to wp-tg` → **Create**。
+
+完成後，**Listener rules** 會有兩列：
+
+| Priority | 條件 | 動作 |
+|---|---|---|
+| `1` | Http header `X-Origin-Verify` is `<暗號>` | Forward to `wp-tg` |
+| `Default` | 其他所有請求 | Forward to `wp-tg`（下一步要改成 403） |
+
+**步驟 2：把預設規則改成回應 403**
+
+1. 在同一個頁面的 **Listener rules** 中，勾選 **Default** 那一列 → 右上 **Actions → Edit rule**。（介面不同時，也可以回到上一頁，勾選 HTTP:80 → **Manage listener → Edit listener**，修改 **Default actions**。）
+2. **Routing actions** 改成 **Return fixed response**：
+
+| 欄位 | 設定 |
+|---|---|
+| **Response code** | `403` |
+| **Content type** | **text/plain** |
+| **Response body** | `Forbidden` |
+
+3. 按 **Save changes**。
+
+**步驟 3：安全群組只允許 CloudFront**
+
+和 2.3 ④ 一樣，主控台**不能直接把 `0.0.0.0/0` 改成前綴清單**，要刪掉舊規則、再新增一條：
+
+1. 主控台搜尋 **VPC** → 左側 **Security groups** → 勾選 **`wp-alb-sg`** → **Inbound rules** 分頁 → **Edit inbound rules**。
+2. 在 HTTP、80、`0.0.0.0/0` 那一列，按 **Delete**。
+3. 按 **Add rule**：
+
+| 欄位 | 設定 |
+|---|---|
+| **Type** | **HTTP**（Port 自動帶出 `80`） |
+| **Source** | **Custom** → 在搜尋框輸入 `cloudfront` → 在 **Prefix lists** 分類下選 **`pl-xxxxxxxx (com.amazonaws.global.cloudfront.origin-facing)`** |
+| **Description** | `HTTP from CloudFront only` |
+
+   ⚠️ 選 `com.amazonaws.global.cloudfront.origin-facing`，不要選名稱裡沒有 `origin-facing` 的清單。
+
+4. 確認只剩這一條規則 → **Save rules**。
+
+> 💡 如果儲存時出現 *The maximum number of rules per security group has been reached*：這份前綴清單有幾十個 IP 範圍，每個都算一條規則，可能超過安全群組預設的 60 條上限。到 **Service Quotas → Amazon VPC → Inbound or outbound rules per security group** 申請提高到 120，或只保留第 2 道鎖（暗號），先跳過這一步。
+
+**方法 B：CloudShell 指令**
+
+這段會**自動從 CloudFront 讀出暗號**，依照「先加規則、再改預設、先加新安全群組規則、再刪舊規則」的順序執行，不用手動填任何值：
+
+```bash
+ALB_ARN=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].LoadBalancerArn" --output text)
+LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Port==\`80\`].ListenerArn | [0]" --output text)
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+SECRET=$(aws cloudfront get-distribution-config --id $CF_ID \
+  --query "DistributionConfig.Origins.Items[0].CustomHeaders.Items[?HeaderName=='X-Origin-Verify'].HeaderValue | [0]" --output text)
+echo "CloudFront：$CF_ID    暗號長度：${#SECRET}（應該是 32）"
+
+if [ ${#SECRET} -ge 16 ] && [ "$SECRET" != "None" ]; then
+  # 1) 新增規則：暗號正確才轉發到 wp-tg（已有 Priority 1 的規則就跳過）
+  R1=$(aws elbv2 describe-rules --listener-arn $LISTENER_ARN --query "Rules[?Priority=='1'].RuleArn | [0]" --output text)
+  if [ "$R1" = "None" ]; then
+    aws elbv2 create-rule --listener-arn $LISTENER_ARN --priority 1 \
+      --conditions '[{"Field":"http-header","HttpHeaderConfig":{"HttpHeaderName":"X-Origin-Verify","Values":["'"$SECRET"'"]}}]' \
+      --actions Type=forward,TargetGroupArn=$TG_ARN \
+      --tags Key=Name,Value=cloudfront-only --query "Rules[0].Priority" --output text && echo "✅ 已新增規則（Priority 1）"
+  else
+    echo "已經有 Priority 1 的規則，跳過"
+  fi
+
+  # 2) 預設規則改成回應 403
+  aws elbv2 modify-listener --listener-arn $LISTENER_ARN \
+    --default-actions '[{"Type":"fixed-response","FixedResponseConfig":{"StatusCode":"403","ContentType":"text/plain","MessageBody":"Forbidden"}}]' \
+    --query "Listeners[0].DefaultActions[0].Type" --output text && echo "✅ 預設規則已改成 403"
+
+  # 3) 安全群組：先加 CloudFront 前綴清單，再刪 0.0.0.0/0
+  ALB_SG=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].SecurityGroups[0]" --output text)
+  PL=$(aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+    --query "PrefixLists[0].PrefixListId" --output text)
+  echo "wp-alb-sg：$ALB_SG    CloudFront 前綴清單：$PL"
+  aws ec2 authorize-security-group-ingress --group-id $ALB_SG \
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":80,"ToPort":80,"PrefixListIds":[{"PrefixListId":"'"$PL"'","Description":"HTTP from CloudFront only"}]}]' \
+    --query "Return" --output text && echo "✅ 已允許 CloudFront"
+  aws ec2 revoke-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0 \
+    --query "Return" --output text && echo "✅ 已刪除 0.0.0.0/0"
+else
+  echo "❌ 讀不到暗號，這次沒有做任何修改。請確認 2.4 的 CloudFront 來源有設定 X-Origin-Verify"
+fi
+```
+
+- `暗號長度` 必須是 `32`。
+- 出現 `InvalidPermission.Duplicate`（規則已經存在）或 `InvalidPermission.NotFound`（舊規則已經刪掉）都沒關係，直接做驗證。
+- 出現 `RulesPerSecurityGroupLimitExceeded`，看方法 A 步驟 3 最後的說明。
+
+✅ **驗證 2.5**（CloudShell）：等 1–2 分鐘讓設定生效，整段貼上：
+
+```bash
+ALB_ARN=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].LoadBalancerArn" --output text)
+ALB_DNS=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].DNSName" --output text)
+LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Port==\`80\`].ListenerArn | [0]" --output text)
+TG_ARN=$(aws elbv2 describe-target-groups --names wp-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+ALB_SG=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].SecurityGroups[0]" --output text)
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CF_DOMAIN=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.DomainName" --output text)
+
+echo "--- 第 2 道鎖：監聽器規則 ---"
+aws elbv2 describe-rules --listener-arn $LISTENER_ARN \
+  --query "Rules[].{Priority:Priority, Header:Conditions[0].HttpHeaderConfig.HttpHeaderName, Action:Actions[0].Type, Code:Actions[0].FixedResponseConfig.StatusCode}" \
+  --output table
+R1=$(aws elbv2 describe-rules --listener-arn $LISTENER_ARN --query "Rules[?Priority=='1'].Actions[0].TargetGroupArn | [0]" --output text)
+DEF=$(aws elbv2 describe-rules --listener-arn $LISTENER_ARN --query "Rules[?IsDefault].Actions[0].FixedResponseConfig.StatusCode | [0]" --output text)
+[ "$R1" = "$TG_ARN" ] && echo "✅ Priority 1：暗號正確 → 轉發到 wp-tg" || echo "❌ 沒有 Priority 1 的轉發規則"
+[ "$DEF" = "403" ] && echo "✅ Default：回應 403" || echo "❌ Default 規則不是 403（目前：$DEF）"
+
+echo "--- 第 1 道鎖：wp-alb-sg ---"
+aws ec2 describe-security-group-rules --filters Name=group-id,Values=$ALB_SG \
+  --query "SecurityGroupRules[?IsEgress==\`false\`].{Port:FromPort, FromCIDR:CidrIpv4, FromPrefixList:PrefixListId}" --output table
+PLN=$(aws ec2 describe-security-group-rules --filters Name=group-id,Values=$ALB_SG \
+  --query "SecurityGroupRules[?IsEgress==\`false\`].PrefixListId | [0]" --output text)
+NAME=$(aws ec2 describe-managed-prefix-lists --prefix-list-ids $PLN --query "PrefixLists[0].PrefixListName" --output text 2>/dev/null)
+OPEN=$(aws ec2 describe-security-group-rules --filters Name=group-id,Values=$ALB_SG \
+  --query "length(SecurityGroupRules[?IsEgress==\`false\` && CidrIpv4=='0.0.0.0/0'])" --output text)
+[ "$NAME" = "com.amazonaws.global.cloudfront.origin-facing" ] && echo "✅ 來源是 CloudFront 前綴清單" || echo "❌ 來源不是 CloudFront 前綴清單（目前：$NAME）"
+[ "$OPEN" = "0" ] && echo "✅ 沒有 0.0.0.0/0" || echo "❌ 還有 0.0.0.0/0 規則，請刪除"
+
+echo "--- 實際連線測試 ---"
+H=$(curl -s -m 15 "https://$CF_DOMAIN/healthz")
+[ "$H" = "ok" ] && echo "✅ 透過 CloudFront：/healthz 回應 ok" || echo "❌ 透過 CloudFront：/healthz 回應「$H」"
+curl -s -m 15 -o /dev/null -w "透過 CloudFront 首頁：HTTP %{http_code}\n" "https://$CF_DOMAIN/"
+C=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "http://$ALB_DNS/")
+case "$C" in
+  000) echo "✅ 直接連 ALB：被擋下（逾時），無法繞過 CloudFront";;
+  403) echo "✅ 直接連 ALB：403 Forbidden（第 2 道鎖生效；第 1 道鎖可能還沒生效）";;
+  *)   echo "❌ 直接連 ALB 還能連上（HTTP $C）";;
+esac
+aws elbv2 describe-target-health --target-group-arn $TG_ARN --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State]" --output text
+```
+
+正確結果類似：
+
+```text
+--- 第 2 道鎖：監聽器規則 ---
+-----------------------------------------------------------
+|                      DescribeRules                      |
++-----------------+--------+-------------------+-----------+
+|     Action      | Code   |      Header       | Priority  |
++-----------------+--------+-------------------+-----------+
+|  forward        |  None  |  X-Origin-Verify  |  1        |
+|  fixed-response |  403   |  None             |  default  |
++-----------------+--------+-------------------+-----------+
+✅ Priority 1：暗號正確 → 轉發到 wp-tg
+✅ Default：回應 403
+--- 第 1 道鎖：wp-alb-sg ---
+--------------------------------------------
+|        DescribeSecurityGroupRules        |
++-----------+------------------+-----------+
+| FromCIDR  | FromPrefixList   |   Port    |
++-----------+------------------+-----------+
+|  None     |  pl-58a04531     |  80       |
++-----------+------------------+-----------+
+✅ 來源是 CloudFront 前綴清單
+✅ 沒有 0.0.0.0/0
+--- 實際連線測試 ---
+✅ 透過 CloudFront：/healthz 回應 ok
+透過 CloudFront 首頁：HTTP 200
+✅ 直接連 ALB：被擋下（逾時），無法繞過 CloudFront
+i-0abc123def4567890	healthy
+```
+
+- 「直接連 ALB」要等 5 秒才出結果，因為被安全群組擋下的連線不會有回應。
+- 目標必須還是 **`healthy`**。健康檢查是 ALB 直接連主機，不受這兩道鎖影響。
+- `pl-` 後面的 ID 每個區域不同，名稱對就好。
+
+**最後用瀏覽器確認：**
+
+1. 打開 `https://<CF_DOMAIN>`：網站正常顯示，網址列有鎖頭，網址**一直維持** `https://xxxx.cloudfront.net`，不會跳回 EIP。
+2. 打開 `https://<CF_DOMAIN>/wp-admin`：用 1.11 建立的管理員帳號登入，可以進入後台。
+3. 打開 `http://<ALB 的 DNS name>`：轉圈圈後顯示無法連線（逾時）。
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| 透過 CloudFront 得到 **403 Forbidden**（純文字） | ALB 規則的暗號和 CloudFront 的不一樣 | 比對 CloudFront **Origins → Edit** 的 `X-Origin-Verify` 值，和 ALB 規則 Priority 1 的值，必須完全相同（前後不能有空白）。或用方法 B 重跑，它會自動讀取 |
+| 透過 CloudFront 得到 **504 Gateway Timeout** | 安全群組的來源不是 CloudFront 的前綴清單，CloudFront 也被擋了 | 回到步驟 3，確認選的是 `com.amazonaws.global.cloudfront.origin-facing` |
+| 瀏覽器顯示 **ERR_TOO_MANY_REDIRECTS** | WordPress 不知道訪客用的是 HTTPS | 回到 2.5-1，確認 `wp-config.php` 有 `HTTP_X_ORIGIN_VERIFY` 那一行 |
+| 首頁跳回 `http://<EIP>` | 網址沒換成功 | 回到 2.5-1 跑驗證，`home` 和 `siteurl` 必須是 CloudFront 網址 |
+| 直接連 ALB 還能連上（HTTP 200） | `0.0.0.0/0` 規則還在，而且預設規則不是 403 | 重新做步驟 2、3 |
+| 版面跑掉、圖片破圖 | 瀏覽器快取了舊網址的資源 | 用無痕視窗打開；或到 CloudFront **Invalidations → Create invalidation**，路徑填 `/*` |
+
+> 有自己的網域？到 **ACM（憑證管理）切到 us-east-1 區域** 申請憑證，在 CloudFront 的 Alternate domain name 填上網域並選擇憑證，再到 DNS 設定 CNAME 指向 `<CF_DOMAIN>`，最後重做 2.5-1（第一行填你的網域）。
 
 ### 2.6 製作 AMI 與啟動範本
 
@@ -3994,6 +4224,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.5-2（10/28 補充） | 收緊 ALB 只有四行說明 | 說明兩道鎖（CloudFront 前綴清單＋暗號標頭）與「先加規則再改預設」的順序；主控台新增規則 5 個畫面、預設規則改 403、安全群組刪除後新增；CLI 自動從 CloudFront 讀出暗號；一鍵驗證、瀏覽器確認與排錯表 |
 | 2.5-1（10/28 實作） | 把 `OLD=http://<EIP>` 原樣貼上，`<` 被 bash 當成重新導向，出現 `syntax error near unexpected token 'newline'`，網址變數是空的 | EIP 改從主機中繼資料自動取得，只需填 CloudFront 網域並自動檢查格式；wp-config 修改改成不會重複加入；加上逐段解釋、正確輸出、驗證與排錯表 |
 | 2.4 方法 A（10/28 實作） | 實際畫面沒有「Choose a plan」這一頁 | 方案選擇改成「有看到就選 Free，沒有就直接往下做（Pay-as-you-go）」；WAF 步驟依方案分成兩種做法 |
 | 2.4（10/28 實作） | 新版主控台建立 distribution 時先選月費方案，畫面看不到 Pay-as-you-go，指南寫的選項對不上 | 改寫 2.4：方案比較表（建議 Free）與四個注意事項；方法 A 依新精靈逐頁說明，強調來源要改 HTTP only（推薦設定是 HTTPS only 會 502）；方法 B 用 CLI 建立 Pay-as-you-go；建立後檢查、一鍵驗證與排錯表；清除步驟加上先取消 Free 方案 |
