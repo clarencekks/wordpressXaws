@@ -3828,18 +3828,180 @@ i-0ccc3333dddd44444  wp-web-asg  healthy
 2. 到 **EC2 → Instances**，手動 Terminate 那台 `wp-web-asg` 主機。
 3. 在 **Auto Scaling Groups → wp-asg → Activity** 看到它自動啟動一台新的；幾分鐘後網站恢復正常。
 
-### 2.8 把告警改成觀察網站錯誤
+### 2.8 把告警改成觀察整個網站
 
-CPU 告警綁的是舊主機 ID，現在改監控整個網站：
+**為什麼需要**：1.12 建立的 `wp-cpu-high` 告警，觀察的是 **`wp-web-1` 這一台主機**（用主機 ID 綁定）。2.7 退役 `wp-web-1` 之後，這台主機不存在了，告警收不到資料，會一直停在 *Insufficient data*。之後 ASG 的主機會被替換、主機 ID 會變，所以**不能再綁單一主機**，要改成觀察「整個網站」：
 
-1. 刪除 `wp-cpu-high`（**CloudWatch → Alarms** → 選取 → Actions → Delete）。
-2. **Create alarm → Select metric → ApplicationELB → Per AppELB Metrics** → 找到 `wp-alb` 的 **`HTTPCode_Target_5XX_Count`** → Select。
-3. Statistic **Sum**、Period **5 minutes**；Threshold **Greater/Equal 10**。
-4. 展開 **Additional configuration → Missing data treatment：Treat missing data as good (not breaching threshold)**。
-5. Notification → `wp-alerts`；名稱 `wp-5xx-high` → 建立。
-6. （選用）同樣方式建立 `wp-asg-cpu-high`：**EC2 → By Auto Scaling Group → wp-asg 的 CPUUtilization**，Average > 80。
+```
+改之前：wp-cpu-high ──► 觀察 wp-web-1 的 CPU（主機已刪除 → 沒有資料）
 
-✅ **驗證**：`wp-5xx-high` 狀態為 **OK**。
+改之後：wp-5xx-high     ──► 觀察 wp-alb：主機回了多少 5xx 錯誤 ──┐
+        wp-asg-cpu-high ──► 觀察 wp-asg：所有主機的平均 CPU    ──┴─► SNS wp-alerts ──► 寄信給你
+```
+
+| 告警 | 觀察什麼 | 什麼時候響 | 為什麼 |
+|---|---|---|---|
+| **`wp-5xx-high`**（必做） | ALB 的 `HTTPCode_Target_5XX_Count`：主機回應 500、502、503 等錯誤的次數 | 5 分鐘內 ≥ 10 次 | 訪客看到錯誤頁，是「網站壞了」最直接的訊號，例如 PHP 錯誤、資料庫連不上 |
+| **`wp-asg-cpu-high`**（建議） | `wp-asg` 所有主機的**平均** CPU | 連續 2 次 5 分鐘平均 > 80% | 取代舊的 `wp-cpu-high`。主機換掉也照樣有資料 |
+
+> 💡 **5xx 是什麼**：網站的回應碼，2xx 是成功，4xx 是訪客的錯（例如 404 找不到網頁），**5xx 是伺服器的錯**。所以我們只觀察 5xx。
+> 💡 **為什麼 CPU 門檻是 80，不是 60**：2.7 的 Auto Scaling 在 CPU 超過 60% 時就會自動加開主機。加開之後還是超過 80%，才代表真的需要人來看。
+> 💡 **CloudWatch 裡有 `TargetTracking-wp-asg-AlarmHigh-...` 和 `...AlarmLow-...` 兩個告警**：這是 2.7 的 Auto Scaling 自動建立的，用來決定什麼時候加減主機，**不會寄信，也不要刪除**。
+
+#### 2.8-1 刪除舊的 `wp-cpu-high`
+
+1. 主控台搜尋 **CloudWatch** → 左側 **Alarms → All alarms**。
+2. 勾選 **`wp-cpu-high`**（State 應該是灰色的 *Insufficient data*）。
+3. 右上 **Actions → Delete** → 確認 **Delete**。
+
+#### 2.8-2 建立 `wp-5xx-high`（網站錯誤告警）
+
+**方法 A：主控台**
+
+1. **CloudWatch → Alarms → All alarms** → 右上 **Create alarm**。
+
+**Step 1：Specify metric and conditions（選指標和條件）**
+
+2. 按 **Select metric**。
+3. 在 **Browse** 分頁依序點：**ApplicationELB** → **Per AppELB Metrics**。
+4. 上方搜尋框輸入 `5XX`，在清單中找到：**LoadBalancer** 欄是 `app/wp-alb/xxxxxxxx`、**Metric name** 是 **`HTTPCode_Target_5XX_Count`** 的那一列 → 勾選 → 按右下 **Select metric**。
+   - ⚠️ 不要選成 `HTTPCode_ELB_5XX_Count`。那是 ALB 自己產生的錯誤（例如沒有健康的主機），`Target` 才是主機回的錯誤。
+   - 找不到這個指標：代表主機還沒回過任何 5xx，CloudWatch 沒有資料就不會列出。改用下面的**方法 B**，不受影響。
+5. **Metric** 區塊：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Statistic** | **Sum** | 加總 5 分鐘內的錯誤次數 |
+| **Period** | **5 minutes** | 每 5 分鐘計算一次 |
+
+6. **Conditions** 區塊：
+
+| 欄位 | 設定 |
+|---|---|
+| **Threshold type** | **Static** |
+| **Whenever HTTPCode_Target_5XX_Count is...** | **Greater/Equal**（`>=`） |
+| **than...** | `10` |
+
+7. 展開 **Additional configuration**：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Datapoints to alarm** | `1` out of `1` | 一次（5 分鐘）超過就響 |
+| **Missing data treatment** | ⚠️ **Treat missing data as good (not breaching threshold)** | 沒有錯誤時，CloudWatch **不會記錄任何資料**（不是記 0）。不改的話，告警會一直顯示 *Insufficient data* |
+
+   按 **Next**。
+
+**Step 2：Configure actions（告警時要做什麼）**
+
+8. **Notification** 區塊：
+   - **Alarm state trigger**：**In alarm**
+   - **Send a notification to the following SNS topic**：**Select an existing SNS topic**
+   - **Send a notification to…**：點一下，選 **`wp-alerts`**
+9. 其他區塊（Lambda action、Auto Scaling action、EC2 action、Systems Manager action）都不要加 → **Next**。
+
+**Step 3：Add name and description**
+
+10. **Alarm name**：`wp-5xx-high`；**Alarm description**：`WordPress returned 10+ server errors in 5 minutes`（選填，只能用英文）→ **Next**。
+
+**Step 4：Preview and create**
+
+11. 確認指標是 `HTTPCode_Target_5XX_Count`（wp-alb）、條件是 `>= 10 for 1 datapoints within 5 minutes`、通知送到 `wp-alerts` → **Create alarm**。
+
+#### 2.8-3 建立 `wp-asg-cpu-high`（整個群組的 CPU 告警）
+
+**方法 A：主控台**
+
+1. **Create alarm** → **Select metric** → **EC2** → **By Auto Scaling Group**。
+2. 找到 **AutoScalingGroupName** 是 `wp-asg`、**Metric name** 是 **`CPUUtilization`** 的那一列 → 勾選 → **Select metric**。
+3. 設定：
+
+| 欄位 | 設定 |
+|---|---|
+| **Statistic** | **Average** |
+| **Period** | **5 minutes** |
+| **Threshold type** | **Static** |
+| **Whenever CPUUtilization is...** | **Greater**（`>`） |
+| **than...** | `80` |
+| **Additional configuration → Datapoints to alarm** | `2` out of `2`（連續 10 分鐘才響，避免短暫尖峰誤報） |
+| **Missing data treatment** | **Treat missing data as missing**（預設） |
+
+4. **Next** → Notification：**In alarm** → `wp-alerts` → **Next**。
+5. **Alarm name**：`wp-asg-cpu-high` → **Next** → **Create alarm**。
+
+#### 方法 B：CloudShell 指令（2.8-1～2.8-3 一次完成）
+
+```bash
+TOPIC_ARN=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':wp-alerts')].TopicArn | [0]" --output text)
+ALB_ARN=$(aws elbv2 describe-load-balancers --names wp-alb --query "LoadBalancers[0].LoadBalancerArn" --output text)
+ALB_DIM=${ALB_ARN#*:loadbalancer/}     # 取出 app/wp-alb/xxxxxxxx 這一段
+echo "SNS：$TOPIC_ARN"
+echo "ALB：$ALB_DIM"
+
+# 1) 刪除舊的告警
+aws cloudwatch delete-alarms --alarm-names wp-cpu-high && echo "✅ 已刪除 wp-cpu-high"
+
+# 2) 網站錯誤告警
+aws cloudwatch put-metric-alarm --alarm-name wp-5xx-high \
+  --alarm-description "WordPress returned 10+ server errors in 5 minutes" \
+  --namespace AWS/ApplicationELB --metric-name HTTPCode_Target_5XX_Count \
+  --dimensions Name=LoadBalancer,Value=$ALB_DIM \
+  --statistic Sum --period 300 --evaluation-periods 1 --datapoints-to-alarm 1 \
+  --threshold 10 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching --alarm-actions $TOPIC_ARN && echo "✅ 已建立 wp-5xx-high"
+
+# 3) 整個群組的 CPU 告警
+aws cloudwatch put-metric-alarm --alarm-name wp-asg-cpu-high \
+  --alarm-description "wp-asg average CPU above 80% for 10 minutes" \
+  --namespace AWS/EC2 --metric-name CPUUtilization \
+  --dimensions Name=AutoScalingGroupName,Value=wp-asg \
+  --statistic Average --period 300 --evaluation-periods 2 --datapoints-to-alarm 2 \
+  --threshold 80 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data missing --alarm-actions $TOPIC_ARN && echo "✅ 已建立 wp-asg-cpu-high"
+```
+
+- `SNS：` 必須印出 `arn:aws:sns:ap-northeast-1:...:wp-alerts`，`ALB：` 必須是 `app/wp-alb/` 開頭。有一個是 `None` 就先不要往下做。
+- `wp-cpu-high` 已經刪過的話會出現錯誤訊息，可以忽略。
+
+#### ✅ 驗證 2.8（CloudShell）
+
+```bash
+aws cloudwatch describe-alarms --alarm-names wp-5xx-high wp-asg-cpu-high wp-cpu-high \
+  --query "MetricAlarms[].[AlarmName, StateValue, MetricName, Threshold, TreatMissingData]" --output text
+for A in wp-5xx-high wp-asg-cpu-high; do
+  T=$(aws cloudwatch describe-alarms --alarm-names $A --query "MetricAlarms[0].AlarmActions[0]" --output text)
+  case "$T" in *:wp-alerts) echo "✅ $A 會通知 wp-alerts";; *) echo "❌ $A 沒有設定通知（目前：$T）";; esac
+done
+N=$(aws cloudwatch describe-alarms --alarm-names wp-cpu-high --query "length(MetricAlarms)" --output text)
+[ "$N" = "0" ] && echo "✅ 舊的 wp-cpu-high 已刪除" || echo "❌ 舊的 wp-cpu-high 還在"
+```
+
+正確結果類似：
+
+```text
+wp-5xx-high	OK	HTTPCode_Target_5XX_Count	10.0	notBreaching
+wp-asg-cpu-high	OK	CPUUtilization	80.0	missing
+✅ wp-5xx-high 會通知 wp-alerts
+✅ wp-asg-cpu-high 會通知 wp-alerts
+✅ 舊的 wp-cpu-high 已刪除
+```
+
+- 前兩行依序是：告警名稱、狀態、指標、門檻、沒有資料時的處理方式。只有兩行（`wp-cpu-high` 已經刪除，所以不會出現）。
+- `wp-5xx-high` 最後一欄必須是 `notBreaching`；`wp-asg-cpu-high` 是 `missing` 或 `None` 都正確。
+- 剛建立時狀態可能是 *INSUFFICIENT_DATA*，等 **5–10 分鐘**會變成 **OK**。
+
+**（選用）測試通知**：把告警暫時切換成 ALARM，幾分鐘內會收到 Email。下一次評估時（最多 5 分鐘）會自動變回 OK。
+
+```bash
+aws cloudwatch set-alarm-state --alarm-name wp-5xx-high --state-value ALARM --state-reason "Test notification"
+```
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| `wp-5xx-high` 一直是 *Insufficient data* | Missing data treatment 沒有改 | Alarms → `wp-5xx-high` → **Actions → Edit** → Additional configuration → 改成 **Treat missing data as good** → Update alarm |
+| 主控台找不到 `HTTPCode_Target_5XX_Count` | 還沒有發生過 5xx，沒有資料 | 用方法 B 建立 |
+| `wp-asg-cpu-high` 一直是 *Insufficient data* | 選錯指標（例如選到某台主機的 CPU），或群組名稱不是 `wp-asg` | 確認是 **By Auto Scaling Group** 底下的 `wp-asg` |
+| 測試時沒有收到信 | SNS 訂閱沒有確認 | SNS → Topics → `wp-alerts` → Subscriptions，Status 要是 **Confirmed**（1.12 Part A） |
+| `wp-5xx-high` 響了 | 主機回了很多 5xx 錯誤 | CloudWatch → Log groups → `/wordpress/php-fpm-error`、`/wordpress/nginx-error` 看錯誤原因；常見是 RDS 連不上或外掛出錯 |
 
 ### ✅ Phase 2 完成檢查表
 
@@ -4782,6 +4944,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.8（10/28 補充） | 告警步驟只有幾行，看不懂為什麼要改、怎麼選指標 | 說明舊告警失效原因與兩個新告警的用途；主控台告警精靈 Step 1～4 逐欄位設定（含 Missing data treatment）、CLI 一次完成、驗證、測試通知與排錯表；提醒不要刪除 Auto Scaling 自動建立的告警 |
 | 2.7 退役舊主機（10/28 補充） | 只有三行，沒有說明順序、等待時間與風險 | 加上退役前確認、三個步驟的原因、主控台逐步操作（Draining、勾錯主機、termination protection、EIP 自動解除關聯）、CLI 做法、驗證、退役後注意事項與排錯表 |
 | 2.7 進階選項（10/28 實作） | 沒有提到 Instance maintenance policy 等新欄位 | 改成欄位表：Instance maintenance policy 選 Prioritize availability（Min 100%、Max 200%），並說明 VPC Lattice、ARC zonal shift、健康檢查與寬限期；依實際畫面把 Instance maintenance policy 與 Additional settings 移到 Group size and scaling 頁 |
 | 2.7 Network（10/28 實作） | 新版主控台多了 Availability Zone distribution 和 Additional capacity settings，指南沒有提到 | 改成欄位表：選 Balanced best effort、Capacity Reservation preference 保持 Default，並說明原因 |
