@@ -3637,17 +3637,29 @@ PY
 | **Application Recovery Controller (ARC) zonal shift** | 不勾選（預設） | 進階的 AZ 故障切換功能，練習用不到 |
 | **Health checks** | ✅ 勾選 **Turn on Elastic Load Balancing health checks** | 除了 EC2 本身的狀態，也採用 ALB 的 `/healthz` 結果。`/healthz` 失敗（例如 EFS 沒掛上）的主機會被自動換掉 |
 | **Health check grace period** | `300` 秒 | 新主機開機後 5 分鐘內不判定健康狀態，給它時間開機、掛上 EFS |
+
+   按 **Next**。
+
+5. **Configure group size and scaling**（這一頁由上到下）：
+
+| 區塊／欄位 | 設定 | 說明 |
+|---|---|---|
+| **Group size → Desired capacity** | `1` | 平常維持 1 台 |
+| **Scaling → Min desired capacity** | `1` | 最少 1 台，主機壞了會自動補 |
+| **Scaling → Max desired capacity** | `2` | 最多 2 台，限制費用上限 |
+| **Automatic scaling** | **Target tracking scaling policy** | 依指標自動增減主機 |
+| └ **Metric type** | **Average CPU utilization** | |
+| └ **Target value** | `60` | 平均 CPU 超過 60% 就加開主機，降下來後再減少 |
 | **Instance maintenance policy** | 選 **Prioritize availability**（Launch before terminating） | 要換主機時，**先開好新主機、確認健康，再關掉舊的**。我們平常只有 1 台，選這個才不會在換主機時讓網站中斷 |
 | └ **Min healthy percentage** | `100` | 換主機期間，健康的主機數量不能少於目前數量 |
 | └ **Max healthy percentage** | ⚠️ 改成 `200` | 換主機期間最多可以暫時變成 2 倍（1 台 → 2 台）。如果用預設的 110%，1 台的群組沒有空間先開新主機 |
-| **Additional settings** | 保持預設（Monitoring、Default instance warmup 都不勾） | |
+| **Additional settings** | 保持預設（Instance scale-in protection、Monitoring、Default instance warmup 都不勾） | |
 
    按 **Next**。
 
    > 💡 **Instance maintenance policy 什麼時候會用到？** 主機健康檢查失敗被替換、2.6-6 的 Instance refresh 換新版 AMI 時。另外兩個選項：*Control costs*（先關舊的再開新的，會中斷）、*Flexible*（自訂百分比）。換主機期間短暫多一台，費用只多幾分錢。
-5. Group size：Desired **1**、Min **1**、Max **2**。
-6. Scaling：**Target tracking scaling policy**，Metric **Average CPU utilization**，Target value `60`。
-7. Next 到最後 → **Create Auto Scaling group**。
+
+6. 後面的頁面（Add notifications、Add tags）都保持預設，按 **Next** 到 **Review** → **Create Auto Scaling group**。
 
 等 3–5 分鐘，`wp-tg` 的 Targets 會出現一台新主機並變 **healthy**。
 
@@ -4615,7 +4627,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
-| 2.7 進階選項（10/28 實作） | 沒有提到 Instance maintenance policy 等新欄位 | 改成欄位表：Instance maintenance policy 選 Prioritize availability（Min 100%、Max 200%），並說明 VPC Lattice、ARC zonal shift、健康檢查與寬限期 |
+| 2.7 進階選項（10/28 實作） | 沒有提到 Instance maintenance policy 等新欄位 | 改成欄位表：Instance maintenance policy 選 Prioritize availability（Min 100%、Max 200%），並說明 VPC Lattice、ARC zonal shift、健康檢查與寬限期；依實際畫面把 Instance maintenance policy 與 Additional settings 移到 Group size and scaling 頁 |
 | 2.7 Network（10/28 實作） | 新版主控台多了 Availability Zone distribution 和 Additional capacity settings，指南沒有提到 | 改成欄位表：選 Balanced best effort、Capacity Reservation preference 保持 Default，並說明原因 |
 | 2.6 硬碟大小（10/28） | AMI 和啟動範本寫成 8 GiB，但 1.7 建立主機時設定的是 20 GiB | 改成 20 GiB，說明啟動範本不能改小，修正快照費用說明 |
 | 2.6（10/28 審核） | 做 AMI 前沒有檢查；`/healthz` 不檢查 EFS，EFS 沒掛上的主機也會被判定健康；重開機後沒有確認；沒有驗證；舊網站檔案（含資料庫密碼）會被打包進 AMI；網路介面欄位不完整 | 改寫為 2.6-1～2.6-6：做 AMI 前檢查與整理（服務開機自動啟動、`/healthz` 檢查 `wp-config.php`、刪除 local-backup）、AMI 主控台／CLI、重開機後檢查、啟動範本逐欄位設定與 CLI、一鍵驗證與排錯、公有 IP 費用與日後更新 AMI 的流程 |
