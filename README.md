@@ -203,9 +203,20 @@ echo $AWS_REGION
 | `<ORIGIN_SECRET>` | 2.4 | |
 | `<CF_DOMAIN>` | 2.4 | |
 | `<MY_DOMAIN>`（自己的網域，選用） | 2.9 | |
-| `<MODEL_ID>` | 3.1 | |
+| `<MODEL_ID>`（推論設定檔 ID，例如 `jp.anthropic.claude-...`） | 3.1 | |
+| 選用的模型名稱（例如 Claude Sonnet …） | 3.1 | |
+| Slack 頻道名稱（例如 `#wp-ops`） | 3.2 | |
+| Slack Webhook 存放位置：`wp-agent/slack-webhook`（Secrets Manager） | 3.2 | ⚠️ 只記名稱，**不要**把 Webhook 網址寫在這裡 |
+| Agent 角色 ARN（`arn:aws:iam::<帳號>:role/wp-agent-role`） | 3.3 | |
+| Lambda 程式位置（`s3://wp-backup-<帳號>/lambda/agent.zip`） | 3.5 | |
+| Agent 檢查的網站網域 `SITE_DOMAIN`（`<MY_DOMAIN>` 或 `<CF_DOMAIN>`，不加 `https://`） | 3.6 | |
+| Lambda 函數 ARN（`arn:aws:lambda:ap-northeast-1:<帳號>:function:wp-ops-agent`） | 3.6 | |
+| 每日巡檢時間（預設 09:00 Asia/Taipei，排程名稱 `wp-daily-health-check`） | 3.7 | |
 
-> 文中出現 `<像這樣>` 的文字，都要換成表中你自己的值，**連同 `<` `>` 一起換掉**。指令貼上後如果出現 `<`、`>` 相關的錯誤，通常就是忘了替換。
+> 文中出現 `<像這樣>` 的文字，都要換成表中你自己的值，**連同 `<` `>` 一起換掉**。指令貼上後如果出現 `<`、`>` 相關的錯誤（例如 `syntax error near unexpected token 'newline'`），通常就是忘了替換。
+> Phase 3 的指令改用雙引號裡的 `"貼上你的MODEL_ID"`、`"貼上你的網域"` 這種寫法：把雙引號**裡面**的文字換成表中的值、**保留雙引號**。忘記替換時，指令會提醒你，不會執行。
+
+> 🔐 這張表裡有 `<ORIGIN_SECRET>` 等敏感值，請存在只有你看得到的地方，不要貼到聊天室或公開的文件。
 
 > **新帳號的「免費方案（Free plan）」限制**：2025 年 7 月之後建立的帳號，若選擇 Free plan，部分服務（例如透過 AWS Marketplace 提供的 Bedrock 第三方模型）可能無法使用。在 Phase 3 遇到「帳號方案不支援」之類的訊息時，到 **Billing and Cost Management → Upgrade plan** 升級成付費方案即可，尚未用完的抵用金會保留。
 
@@ -5666,6 +5677,7 @@ chmod +x /usr/local/bin/wp
 | 3.7 | 精靈欄位簡略，沒提醒時區預設是 UTC、Retry 要關閉 | 逐欄位表格、CLI 驗證 |
 | 3.8 | 只有主控台做法；網址要手動替換 `<CF_DOMAIN>`；沒有確認 SNS 訂閱 | 新增 CLI 做法、訂閱驗證、步驟化測試與排錯表；支援 2.9 自訂網域 |
 | 3.9（新增） | 沒有整體驗證 | 一鍵驗證 Lambda、環境變數、排程、SNS 訂閱、日誌保留 |
+| 準備 5 數值記錄表（10/29 補充） | 沒有 Phase 3 會用到的值 | 新增模型名稱、Slack 頻道與 secret 名稱、角色與 Lambda ARN、程式位置、`SITE_DOMAIN`、巡檢時間；說明「貼上你的…」寫法與敏感值的保存 |
 
 ## v3 修正紀錄
 
