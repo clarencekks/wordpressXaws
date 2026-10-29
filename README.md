@@ -1,6 +1,6 @@
 # WordPress × AWS AI Agent：小白一步一步建置指南（v3）
 
-> 📌 **本 README 即為最新版（v3，2026-10-28 更新）的完整建置指南。** 各版本檔案保存在 [`docs/`](docs/)：
+> 📌 **本 README 即為最新版（v3，2026-10-29 更新）的完整建置指南。** 各版本檔案保存在 [`docs/`](docs/)：
 >
 > | 版本 | 檔案 | 說明 |
 > |---|---|---|
@@ -33,6 +33,7 @@
 - [2. 準備工作：帳號安全與預算警報](#2-準備工作帳號安全與預算警報)
 - [Phase 1：單台 EC2 + RDS + 安全基礎](#phase-1單台-ec2--rds--安全基礎)
 - [Phase 2：ALB + Auto Scaling + CloudFront + S3（高可用）](#phase-2alb--auto-scaling--cloudfront--s3高可用)
+  - [2.9 用自己的網域（Route 53，選用）](#29-用自己的網域route-53)
 - [Phase 3：AI Agent 維運層（唯讀巡檢）](#phase-3ai-agent-維運層唯讀巡檢)
 - [Phase 3 之後：審核後修復與自主修復](#phase-3-之後審核後修復與自主修復)
 - [清除所有資源（避免持續扣款）](#清除所有資源避免持續扣款)
@@ -198,6 +199,7 @@ echo $AWS_REGION
 | ALB 的 DNS name | 2.3 | |
 | `<ORIGIN_SECRET>` | 2.4 | |
 | `<CF_DOMAIN>` | 2.4 | |
+| `<MY_DOMAIN>`（自己的網域，選用） | 2.9 | |
 | `<MODEL_ID>` | 3.1 | |
 
 > 文中出現 `<像這樣>` 的文字，都要換成表中你自己的值，**連同 `<` `>` 一起換掉**。指令貼上後如果出現 `<`、`>` 相關的錯誤，通常就是忘了替換。
@@ -3295,7 +3297,7 @@ i-0abc123def4567890	healthy
 | 直接連 ALB 還能連上（HTTP 200） | `0.0.0.0/0` 規則還在，而且預設規則不是 403 | 重新做步驟 2、3 |
 | 版面跑掉、圖片破圖 | 瀏覽器快取了舊網址的資源 | 用無痕視窗打開；或到 CloudFront **Invalidations → Create invalidation**，路徑填 `/*` |
 
-> 有自己的網域？到 **ACM（憑證管理）切到 us-east-1 區域** 申請憑證，在 CloudFront 的 Alternate domain name 填上網域並選擇憑證，再到 DNS 設定 CNAME 指向 `<CF_DOMAIN>`，最後重做 2.5-1（第一行填你的網域）。
+> 想用自己的網域（例如 `https://example.com`）？見 **2.9 用自己的網域（Route 53）**。
 
 ### 2.6 製作 AMI 與啟動範本
 
@@ -4005,14 +4007,387 @@ aws cloudwatch set-alarm-state --alarm-name wp-5xx-high --state-value ALARM --st
 | 測試時沒有收到信 | SNS 訂閱沒有確認 | SNS → Topics → `wp-alerts` → Subscriptions，Status 要是 **Confirmed**（1.12 Part A） |
 | `wp-5xx-high` 響了 | 主機回了很多 5xx 錯誤 | CloudWatch → Log groups → `/wordpress/php-fpm-error`、`/wordpress/nginx-error` 看錯誤原因；常見是 RDS 連不上或外掛出錯 |
 
+### 2.9 用自己的網域（Route 53）
+
+**為什麼需要**：現在的網址 `https://d1234abcd.cloudfront.net` 很難記，也看不出是誰的網站。這一步會用 **Route 53** 註冊一個自己的網域（以下用 `example.com` 舉例），讓訪客用 `https://example.com` 連到網站，HTTPS 憑證一樣免費。
+
+```
+訪客輸入 example.com
+   │
+   ▼
+Route 53（DNS）：example.com 在哪裡？ ──► 答：在 CloudFront（Alias 記錄）
+   │
+   ▼
+CloudFront：出示 example.com 的憑證（ACM，免費）──► wp-alb ──► wp-asg 的主機
+                                                 （後面的架構完全不變）
+```
+
+> 名詞：
+> - **網域（Domain）**：網站的名字，例如 `example.com`。要向網域註冊商**付年費**取得使用權，Route 53 就是一個註冊商。
+> - **DNS**：網際網路的「電話簿」，把網域名稱翻譯成伺服器的位址。
+> - **Hosted zone（託管區域）**：Route 53 裡存放某個網域 DNS 記錄的地方。在 Route 53 註冊網域時會自動建立。
+> - **Alias 記錄**：Route 53 特有的記錄，可以讓 `example.com`（最上層的網域，不能用 CNAME）直接指向 CloudFront，而且查詢**免費**。
+> - **ACM（AWS Certificate Manager）**：免費發 HTTPS 憑證的服務。⚠️ **CloudFront 只能使用 `us-east-1`（維吉尼亞北部）區域的憑證**，申請時一定要切換區域。
+
+**本節的設定**：
+
+| 項目 | 設定 |
+|---|---|
+| 主網址 | `https://example.com` |
+| `www.example.com` | 也能連，WordPress 會自動轉到主網址 |
+| 不受影響的部分 | ALB 的兩道鎖、暗號標頭、Auto Scaling、EFS、RDS 都不用改 |
+
+> 💰 **費用**：
+> - **網域**：每年約 $3–15，依後綴而定（例如 `.click`、`.link` 比較便宜，`.com` 約 $15）。主控台搜尋時會顯示價格。⚠️ **註冊後不能退費**，也不能刪除，只能關掉自動續約讓它到期。
+> - **Hosted zone**：每月 $0.50。
+> - **ACM 憑證**：免費。指向 CloudFront 的 Alias 查詢：免費。
+
+> ⏱ **時間**：註冊網域通常 10–30 分鐘完成，少數後綴要幾個小時。憑證驗證約 5–30 分鐘。可以先做 2.9-1，等待期間休息。
+
+#### 2.9-1 註冊網域
+
+> ⚠️ **這一步會立刻扣款，而且不能退費。** 送出前請確認網域名稱的拼字。
+
+1. 主控台上方搜尋 **Route 53** → 左側 **Domains → Registered domains** → **Register domains**。
+2. **Search for domain**：輸入想要的名稱（例如 `mywpdemo`）→ **Search**。
+3. 結果會列出各種後綴（`.com`、`.net`、`.click`…）和**每年價格**。可以註冊的會顯示 **Available**。選一個 → **Select** → **Proceed to checkout**。
+4. **Pricing**：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Duration** | `1 year` | 練習用一年就夠 |
+| **Auto-renew** | 依需求。**練習用建議關閉** | 開啟的話，每年到期前會自動扣款續約 |
+
+   按 **Next**。
+
+5. **Contact information**（聯絡資料）：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Contact type** | **Person** | 個人 |
+| 姓名、地址、電話、Email | 填**真實資料**，英文 | 網域註冊規定要真實資料，Email 會收到驗證信 |
+| **Privacy protection** | ✅ **保持開啟** | 隱藏你的個人資料，別人查詢網域時看不到 |
+| Registrant／Admin／Tech contact | **Same as registrant contact**（預設） | |
+
+   按 **Next**。
+
+6. **Review**：確認網域名稱和價格 → 勾選同意條款 → **Submit**。
+7. 到 Email 收信。主旨類似 *Verify your email address for example.com*，點信中的連結驗證。⚠️ **15 天內沒有驗證，網域會被暫停。**
+8. 左側 **Domains → Requests** 可以看進度，**Status** 從 *In progress* 變成 **Successful** 就完成了。
+9. 完成後，左側 **Hosted zones** 會自動出現一個名稱是 `example.com` 的 Hosted zone，裡面已經有 **NS** 和 **SOA** 兩筆記錄。**不要刪除或修改它們。**
+
+把網域記到「準備 5：數值記錄表」的 `<MY_DOMAIN>`（例如 `example.com`，不要加 `https://`、不要加 `www`）。
+
+✅ **驗證 2.9-1**（CloudShell）：先把第一行換成你的網域：
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你註冊的網域
+aws route53domains get-domain-detail --region us-east-1 --domain-name $MY_DOMAIN \
+  --query "{Domain:DomainName, AutoRenew:AutoRenew, Expiry:ExpirationDate, Privacy:RegistrantPrivacy}" --output table
+ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name $MY_DOMAIN --query "HostedZones[?Name=='$MY_DOMAIN.'].Id | [0]" --output text)
+echo "Hosted zone：$ZONE_ID"
+REG_NS=$(aws route53domains get-domain-detail --region us-east-1 --domain-name $MY_DOMAIN --query "Nameservers[].Name" --output text | tr '\t' '\n' | sort | tr '\n' ' ')
+ZONE_NS=$(aws route53 get-hosted-zone --id $ZONE_ID --query "DelegationSet.NameServers" --output text | tr '\t' '\n' | sort | tr '\n' ' ')
+[ "$REG_NS" = "$ZONE_NS" ] && echo "✅ 網域的 Name server 和 Hosted zone 一致" || echo "❌ Name server 不一致（網域：$REG_NS／Hosted zone：$ZONE_NS）"
+```
+
+- 表格顯示你的網域、到期日，`Privacy` 是 `True`。
+- `Hosted zone：` 印出 `/hostedzone/Z` 開頭的 ID。
+- 最後一行是 ✅。如果是 ❌，通常是自己又多建了一個同名的 Hosted zone，見 2.9-7 排錯表。
+
+> `route53domains` 指令只能在 `us-east-1` 執行，所以加了 `--region us-east-1`。
+
+#### 2.9-2 申請 HTTPS 憑證（ACM，us-east-1）
+
+**方法 A：主控台**
+
+1. 主控台上方搜尋 **Certificate Manager**。
+2. ⚠️ **把右上角的區域切換成 `US East (N. Virginia) us-east-1`。** 這是最常見的錯誤：在東京申請的憑證，CloudFront 看不到。
+3. **Request a certificate** → 選 **Request a public certificate** → **Next**。
+4. 填：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Fully qualified domain name** | `example.com` | 換成你的網域 |
+| **Add another name to this certificate** | `www.example.com` | 一張憑證同時保護兩個名稱 |
+| **Allow export** | **Disable export**（預設） | |
+| **Validation method** | **DNS validation - recommended** | 用 DNS 記錄證明網域是你的 |
+| **Key algorithm** | **RSA 2048**（預設） | |
+
+5. 按 **Request**。畫面會進入憑證詳細頁，**Status** 是 *Pending validation*。
+6. 在 **Domains** 區塊按 **Create records in Route 53** → 兩個網域都勾選 → **Create records**。Route 53 會自動加上驗證用的 CNAME 記錄。
+7. 約 **5–30 分鐘**後，**Status** 變成 **Issued**（綠色）。可以按右上的重新整理圖示。
+
+**方法 B：CloudShell 指令**
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域
+ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name $MY_DOMAIN --query "HostedZones[?Name=='$MY_DOMAIN.'].Id | [0]" --output text)
+
+CERT_ARN=$(aws acm request-certificate --region us-east-1 --domain-name $MY_DOMAIN \
+  --subject-alternative-names www.$MY_DOMAIN --validation-method DNS \
+  --tags Key=Name,Value=wp-cert --query CertificateArn --output text)
+echo "憑證：$CERT_ARN"
+sleep 15   # 等 ACM 產生驗證記錄
+
+# 把驗證用的 CNAME 加到 Route 53（兩個名稱的記錄可能相同，重複的會自動略過）
+aws acm describe-certificate --region us-east-1 --certificate-arn $CERT_ARN \
+  --query "Certificate.DomainValidationOptions[].ResourceRecord.[Name,Value]" --output text | sort -u |
+while read NAME VALUE; do
+  aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch \
+    '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"'"$NAME"'","Type":"CNAME","TTL":300,"ResourceRecords":[{"Value":"'"$VALUE"'"}]}}]}' \
+    --query "ChangeInfo.Status" --output text
+done
+
+echo "等待憑證核發（約 5–30 分鐘，期間畫面不會有輸出）…"
+aws acm wait certificate-validated --region us-east-1 --certificate-arn $CERT_ARN && echo "✅ 憑證已核發（Issued）"
+```
+
+✅ **驗證 2.9-2**（CloudShell）：
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域
+aws acm list-certificates --region us-east-1 \
+  --query "CertificateSummaryList[?DomainName=='$MY_DOMAIN'].{Domain:DomainName, Status:Status, Arn:CertificateArn}" --output table
+```
+
+**Status** 必須是 **ISSUED**。顯示 `PENDING_VALIDATION` 就再等一下；表格是空的，代表憑證不是在 `us-east-1` 申請的。
+
+#### 2.9-3 讓 CloudFront 接受你的網域
+
+**方法 A：主控台**
+
+1. **CloudFront → Distributions** → 點 **`wp-cf`** → **General** 分頁 → **Settings** 區塊右上 **Edit**。
+2. 填：
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Alternate domain name (CNAME)** | 按 **Add item** 兩次，填 `example.com` 和 `www.example.com` | CloudFront 只接受列在這裡的網域 |
+| **Custom SSL certificate** | 從下拉選單選 2.9-2 的憑證（`example.com`） | 選單是空的：憑證不是在 us-east-1，或還沒 Issued |
+| **Security policy** | **TLSv1.2_2021 (recommended)**（預設） | |
+| **IPv6** | **On** | 讓使用 IPv6 的訪客也能連（2.9-4 會建 AAAA 記錄） |
+
+   其他欄位不要動 → **Save changes**。
+
+3. **Last modified** 會變成 *Deploying*，約 5–10 分鐘後變回日期時間。
+
+**方法 B：CloudShell 指令**
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CERT_ARN=$(aws acm list-certificates --region us-east-1 --certificate-statuses ISSUED \
+  --query "CertificateSummaryList[?DomainName=='$MY_DOMAIN'].CertificateArn | [0]" --output text)
+echo "CloudFront：$CF_ID    憑證：$CERT_ARN"
+
+aws cloudfront get-distribution-config --id $CF_ID > cf-current.json
+ETAG=$(python3 -c "import json;print(json.load(open('cf-current.json'))['ETag'])")
+MY_DOMAIN=$MY_DOMAIN CERT_ARN=$CERT_ARN python3 - <<'PY'
+import json, os
+d = os.environ["MY_DOMAIN"]
+c = json.load(open("cf-current.json"))["DistributionConfig"]
+c["Aliases"] = {"Quantity": 2, "Items": [d, "www." + d]}
+c["ViewerCertificate"] = {"ACMCertificateArn": os.environ["CERT_ARN"], "SSLSupportMethod": "sni-only",
+                          "MinimumProtocolVersion": "TLSv1.2_2021", "CloudFrontDefaultCertificate": False}
+c["IsIPV6Enabled"] = True
+json.dump(c, open("cf-new.json", "w"))
+print("✅ 已產生新設定")
+PY
+aws cloudfront update-distribution --id $CF_ID --if-match $ETAG --distribution-config file://cf-new.json \
+  --query "Distribution.{Status:Status, Aliases:DistributionConfig.Aliases.Items}" --output json
+```
+
+- 第一行的 `憑證：` 必須印出 `arn:aws:acm:us-east-1:...`。是 `None` 就代表憑證還沒 Issued 或不在 us-east-1，先不要往下做。
+- 最後印出 `"Status": "InProgress"` 和你的兩個網域就成功了。約 5–10 分鐘後部署完成。
+
+#### 2.9-4 建立 DNS 記錄：網域指向 CloudFront
+
+要建立 4 筆 Alias 記錄：
+
+| 記錄名稱 | 類型 | 指向 | 用途 |
+|---|---|---|---|
+| `example.com` | **A** | CloudFront `wp-cf` | IPv4 訪客 |
+| `example.com` | **AAAA** | CloudFront `wp-cf` | IPv6 訪客 |
+| `www.example.com` | **A** | CloudFront `wp-cf` | IPv4 訪客 |
+| `www.example.com` | **AAAA** | CloudFront `wp-cf` | IPv6 訪客 |
+
+**方法 A：主控台**
+
+1. **Route 53 → Hosted zones** → 點 **`example.com`** → **Create record**。
+2. 第一筆：
+
+| 欄位 | 設定 |
+|---|---|
+| **Record name** | 保持**空白**（代表 `example.com` 本身） |
+| **Record type** | **A – Routes traffic to an IPv4 address and some AWS resources** |
+| **Alias** | ✅ 打開 |
+| **Route traffic to** | **Alias to CloudFront distribution** → 下方選 `dxxxx.cloudfront.net`（你的 `wp-cf`） |
+| **Routing policy** | **Simple routing** |
+| **Evaluate target health** | 不能修改（CloudFront 固定為 No） |
+
+3. 按 **Add another record**，用同樣的方式加入：
+   - 第二筆：Record name 空白、Record type **AAAA**，其他同上。
+   - 第三筆：Record name 填 `www`、Record type **A**，其他同上。
+   - 第四筆：Record name 填 `www`、Record type **AAAA**，其他同上。
+4. 按 **Create records**。Hosted zone 會多出 4 筆記錄（加上原本的 NS、SOA 和 2.9-2 的 CNAME）。
+
+   - 下拉選單找不到 CloudFront：2.9-3 的 Alternate domain name 還沒加或還在部署，等部署完成再試。
+
+**方法 B：CloudShell 指令**
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域
+ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name $MY_DOMAIN --query "HostedZones[?Name=='$MY_DOMAIN.'].Id | [0]" --output text)
+CF_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].Id | [0]" --output text)
+CF_DOMAIN=$(aws cloudfront get-distribution --id $CF_ID --query "Distribution.DomainName" --output text)
+echo "Hosted zone：$ZONE_ID    CloudFront：$CF_DOMAIN"
+
+# Z2FDTNDATAQYW2 是 AWS 規定的 CloudFront 固定 Hosted zone ID（所有人都一樣）
+CHANGES=""
+for NAME in $MY_DOMAIN www.$MY_DOMAIN; do
+  for TYPE in A AAAA; do
+    CHANGES="$CHANGES{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"$NAME\",\"Type\":\"$TYPE\",\"AliasTarget\":{\"HostedZoneId\":\"Z2FDTNDATAQYW2\",\"DNSName\":\"$CF_DOMAIN\",\"EvaluateTargetHealth\":false}}},"
+  done
+done
+aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID \
+  --change-batch "{\"Changes\":[${CHANGES%,}]}" --query "ChangeInfo.Status" --output text
+```
+
+印出 `PENDING` 就成功了，約 1 分鐘後變成生效（`INSYNC`）。
+
+#### 2.9-5 WordPress 改用新網址（Session Manager，root）
+
+⚠️ **一定要先確認新網址已經連得到，再換 WordPress 的網址。** 順序反了，網站和後台都會打不開。
+
+**開始前**：在 CloudShell 執行，必須回應 `ok`（把網域換成你的）：
+
+```bash
+curl -s -m 15 https://example.com/healthz; echo
+```
+
+- 回應 `ok`：DNS、憑證、CloudFront 都設定好了，可以往下做。
+- `Could not resolve host`：DNS 還沒生效，等 5–10 分鐘再試。
+- 憑證錯誤（`SSL certificate problem`）：2.9-3 還在部署，或憑證沒有選對。
+
+**換網址**：Session Manager 登入 **`wp-web-asg`**（EC2 → Instances → 選 `wp-web-asg` → Connect → Session Manager）→ `sudo -i`，**先改第一行**再整段貼上：
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域（不要加 https://、www、< >）
+
+cd /var/www/html
+case "$MY_DOMAIN" in
+  example.com) echo "❌ 還沒把第一行換成你的網域，這次不會修改任何東西";;
+  *.cloudfront.net|www.*|*/*|*" "*) echo "❌ 網域格式不對（不要填 cloudfront.net、www、https://），這次不會修改任何東西";;
+  *.*)
+    OLD=$(sudo -u apache wp option get home)
+    NEW="https://$MY_DOMAIN"
+    if [ "$(curl -s -m 15 https://$MY_DOMAIN/healthz)" != "ok" ]; then
+      echo "❌ https://$MY_DOMAIN/healthz 還連不到，先完成 2.9-2～2.9-4，這次不會修改任何東西"
+    else
+      echo "要換掉的舊網址：$OLD"
+      echo "要換成的新網址：$NEW"
+      sudo -u apache wp option update home "$NEW"
+      sudo -u apache wp option update siteurl "$NEW"
+      sudo -u apache wp search-replace "$OLD" "$NEW" --skip-columns=guid
+    fi
+    ;;
+  *) echo "❌ 網域格式不對，這次不會修改任何東西";;
+esac
+```
+
+| 指令 | 意思 |
+|---|---|
+| `case ... esac` | 檢查第一行有沒有填對，填錯就什麼都不做 |
+| `OLD=$(... wp option get home)` | 直接讀出 WordPress 目前的網址（2.5-1 設定的 CloudFront 網址），不用手動填 |
+| `curl ... /healthz` | 再確認一次新網址連得到，才開始修改 |
+| `wp option update`、`wp search-replace` | 和 2.5-1 一樣，換掉網站網址和資料庫中的舊網址 |
+
+正確結果類似：
+
+```text
+要換掉的舊網址：https://d1234abcd.cloudfront.net
+要換成的新網址：https://example.com
+Success: Updated 'home' option.
+Success: Updated 'siteurl' option.
+...
+Success: Made 3 replacements.
+```
+
+> 💡 2.5-1 加在 `wp-config.php` 的 HTTPS 判斷不用改，它看的是 CloudFront 的暗號標頭，和網址無關。
+> 💡 `www.example.com` 不用另外設定：CloudFront 會把訪客輸入的網址原樣轉給 WordPress（2.4 的 AllViewer），WordPress 發現和主網址不同，會自動 301 轉到 `https://example.com`。
+
+#### 2.9-6 驗證 2.9（CloudShell）
+
+先改第一行，再整段貼上：
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域
+python3 - "$MY_DOMAIN" <<'PY'
+import socket, sys
+d = sys.argv[1]
+for name in (d, "www." + d):
+    try:
+        ips = sorted({a[4][0] for a in socket.getaddrinfo(name, 443)})
+        print("✅ %s 可以解析：%s" % (name, ", ".join(ips[:2]) + (" …" if len(ips) > 2 else "")))
+    except Exception as e:
+        print("❌ %s 無法解析（%s）" % (name, e))
+PY
+H=$(curl -s -m 15 "https://$MY_DOMAIN/healthz")
+[ "$H" = "ok" ] && echo "✅ https://$MY_DOMAIN/healthz：ok（憑證有效）" || echo "❌ https://$MY_DOMAIN/healthz 回應「$H」"
+curl -s -m 15 -o /dev/null -w "首頁：HTTP %{http_code}\n" "https://$MY_DOMAIN/"
+R=$(curl -s -m 15 -o /dev/null -w "%{http_code} %{redirect_url}" "https://www.$MY_DOMAIN/")
+case "$R" in 301*"https://$MY_DOMAIN/"*) echo "✅ www 會轉到主網址（$R）";; *) echo "❌ www 沒有轉到主網址（$R）";; esac
+R=$(curl -s -m 15 -o /dev/null -w "%{http_code} %{redirect_url}" "http://$MY_DOMAIN/")
+case "$R" in 301*https://*) echo "✅ http 會轉到 https（$R）";; *) echo "❌ http 沒有轉到 https（$R）";; esac
+EXP=$(curl -s -m 15 -o /dev/null -w "%{ssl_verify_result}" "https://$MY_DOMAIN/healthz")
+[ "$EXP" = "0" ] && echo "✅ 憑證驗證通過" || echo "❌ 憑證驗證失敗（代碼 $EXP）"
+```
+
+正確結果類似：
+
+```text
+✅ example.com 可以解析：13.32.x.x, 13.32.x.x …
+✅ www.example.com 可以解析：13.32.x.x, 13.32.x.x …
+✅ https://example.com/healthz：ok（憑證有效）
+首頁：HTTP 200
+✅ www 會轉到主網址（301 https://example.com/）
+✅ http 會轉到 https（301 https://example.com/）
+✅ 憑證驗證通過
+```
+
+**最後用瀏覽器確認**：
+1. 打開 `https://example.com`：網站正常，網址列有鎖頭。點鎖頭 → 憑證資訊，**發給**的對象是 `example.com`。
+2. 打開 `https://www.example.com`：自動轉到 `https://example.com`。
+3. 打開 `https://example.com/wp-admin`：可以登入，登入後網址一直維持 `https://example.com`。
+4. 把新網域記到「準備 5：數值記錄表」。**Phase 3 的 `SITE_URL` 要改用這個網域。**
+
+#### 2.9-7 排錯
+
+| 出現的狀況 | 原因 | 解法 |
+|---|---|---|
+| 網域註冊 Status 是 *Failed* | 聯絡資料不完整，或網域已被別人註冊 | 看 Requests 的錯誤訊息，修正後重新註冊（失敗不會扣款） |
+| 收不到驗證信 | 被歸到垃圾信件 | Route 53 → Registered domains → 點網域 → **Resend email** |
+| 憑證一直是 *Pending validation* | 驗證用的 CNAME 沒有加到 Hosted zone | 憑證頁按 **Create records in Route 53**；或確認 2.9-1 驗證的 Name server 一致 |
+| CloudFront 的憑證下拉選單是空的 | 憑證不是在 us-east-1，或還沒 Issued | 切到 us-east-1 檢查；在東京申請的要刪掉重新申請 |
+| 儲存 CloudFront 時出現 *CNAMEAlreadyExists* | 這個網域已經掛在別的 CloudFront 上 | 確認沒有建立第二個 distribution；有的話把網域從那裡移除 |
+| `Could not resolve host` | DNS 還沒生效，或 4 筆 Alias 記錄沒建好 | 等 5–10 分鐘；到 Hosted zone 確認有 A／AAAA 記錄；跑 2.9-1 驗證確認 Name server 一致 |
+| Name server 不一致 | 自己多建了一個同名 Hosted zone，記錄建在錯的那一個 | 保留和網域 Name server 相同的那個，刪掉多的（先刪裡面自己建的記錄） |
+| 新網址顯示 **403 ERROR — The request could not be satisfied** | CloudFront 的 Alternate domain name 沒有這個網域 | 回到 2.9-3 加上，等部署完成 |
+| 網站被轉回 `dxxxx.cloudfront.net` | WordPress 網址沒換成功 | 重跑 2.9-5；Session Manager 執行 `sudo -u apache wp --path=/var/www/html option get home` 確認 |
+| **ERR_TOO_MANY_REDIRECTS** | `wp-config.php` 的 HTTPS 判斷不見了 | 回到 2.5-1 驗證，`HTTP_X_ORIGIN_VERIFY` 那一行要存在 |
+| 換網址後後台登不進去 | 瀏覽器還留著舊網址的 Cookie | 用無痕視窗登入，或清除瀏覽器 Cookie |
+
+> 🗑️ **清除時要多做的事**（已加入「清除所有資源」）：刪除 4 筆 Alias 記錄和 ACM 驗證記錄、刪除 Hosted zone（停止每月 $0.50）、CloudFront 刪除後再刪除 us-east-1 的憑證、**關閉網域的自動續約**。網域本身無法刪除，會在到期日自動失效。
+
 ### ✅ Phase 2 完成檢查表
 
-- [ ] `https://<CF_DOMAIN>` 有鎖頭並能登入後台
+- [ ] `https://<CF_DOMAIN>` 有鎖頭並能登入後台（做了 2.9 的話改成 `https://<MY_DOMAIN>`）
 - [ ] 直接連 ALB 或主機都被擋下
 - [ ] Terminate 主機後 ASG 會自動補上
 - [ ] S3 `db/` 有每日備份
 - [ ] 舊 Elastic IP 已釋放
 - [ ] `wp-5xx-high` 告警為 OK
+- [ ] （做了 2.9）`https://www.<MY_DOMAIN>` 會轉到 `https://<MY_DOMAIN>`，2.9-6 驗證全部 ✅
 
 ---
 
@@ -4391,7 +4766,7 @@ aws s3 cp agent.zip s3://$BUCKET/lambda/agent.zip
 
 ```bash
 MODEL_ID=<MODEL_ID>
-CF_DOMAIN=<CF_DOMAIN>        # 例如 d1234abcd.cloudfront.net（不要加 https://）
+CF_DOMAIN=<CF_DOMAIN>        # 例如 d1234abcd.cloudfront.net（不要加 https://）；做了 2.9 的話填你的網域，例如 example.com
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 # 沒有設定 Slack（跳過 3.2）的話，把下一行的值改成空字串：SLACK_SECRET_ID=
@@ -4543,6 +4918,9 @@ rm -f /var/www/html/wp-content/mu-plugins/boom-test.php
 7. **EFS** → 刪除 `wp-efs`（輸入 File system ID 確認）。
 8. **CloudWatch → Alarms** → 刪除 `wp-5xx-high`、`wp-asg-cpu-high`。
 9. **S3** → 進入 `wp-backup-<ACCOUNT_ID>` → **Empty** → 再 **Delete** bucket。
+10. **（做了 2.9）Route 53 → Hosted zones → 你的網域**：刪除自己建立的記錄（4 筆 A／AAAA Alias、ACM 驗證用的 CNAME），**NS、SOA 不用刪** → 回到 Hosted zones 列表，刪除這個 Hosted zone（停止每月 $0.50）。
+11. **（做了 2.9）Certificate Manager（切到 us-east-1）**：CloudFront 刪除後，刪除 `example.com` 的憑證（憑證還被 CloudFront 使用時無法刪除）。
+12. **（做了 2.9）Route 53 → Registered domains → 你的網域** → 關閉 **Auto-renew**。網域無法刪除或退費，會在到期日自動失效。
 
 ### 刪除 Phase 1
 
@@ -4946,6 +5324,7 @@ chmod +x /usr/local/bin/wp
 | 3.6 | 主控台的「Amazon S3 location」需要 https 格式的網址，貼 `s3://` 可能失敗；手動設定項目多 | 改成一行 `aws lambda create-function`，自動帶入角色與程式位置 |
 | 3.5 | bucket 名稱要手動替換 | 自動帶入帳號 ID |
 | 清除 | 缺少刪除保護、SNS 的 Lambda 訂閱、ACM 憑證、CloudShell 檔案 | 已補上 |
+| 2.9（10/29 新增） | 只能用 `dxxxx.cloudfront.net` 網址，沒有自訂網域的步驟 | 新增 2.9：Route 53 註冊網域、us-east-1 ACM 憑證、CloudFront 加上網域、4 筆 Alias 記錄、WordPress 安全換網址（先確認新網址可連）、一鍵驗證與排錯；數值記錄表、Phase 2 檢查表、Phase 3 `SITE_URL`、清除步驟同步更新 |
 | 2.8（10/28 補充） | 告警步驟只有幾行，看不懂為什麼要改、怎麼選指標 | 說明舊告警失效原因與兩個新告警的用途；主控台告警精靈 Step 1～4 逐欄位設定（含 Missing data treatment）、CLI 一次完成、驗證、測試通知與排錯表；提醒不要刪除 Auto Scaling 自動建立的告警 |
 | 2.7 退役舊主機（10/28 補充） | 只有三行，沒有說明順序、等待時間與風險 | 加上退役前確認、三個步驟的原因、主控台逐步操作（Draining、勾錯主機、termination protection、EIP 自動解除關聯）、CLI 做法、驗證、退役後注意事項與排錯表 |
 | 2.7 進階選項（10/28 實作） | 沒有提到 Instance maintenance policy 等新欄位 | 改成欄位表：Instance maintenance policy 選 Prioritize availability（Min 100%、Max 200%），並說明 VPC Lattice、ARC zonal shift、健康檢查與寬限期；依實際畫面把 Instance maintenance policy 與 Additional settings 移到 Group size and scaling 頁 |
