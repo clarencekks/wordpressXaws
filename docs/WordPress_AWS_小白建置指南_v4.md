@@ -4049,7 +4049,23 @@ CloudFront：出示 example.com 的憑證（ACM，免費）──► wp-alb ─�
 
 > ⏱ **時間**：註冊網域通常 10–30 分鐘完成，少數後綴要幾個小時。憑證驗證約 5–30 分鐘。可以先做 2.9-1，等待期間休息。
 
-#### 2.9-1 註冊網域
+> 🆓 **Free 方案（免費方案）帳號注意**：Free 方案的帳號**不能在 Route 53 註冊網域**，所以 **2.9-1 是選用的**。先看自己屬於哪一種：
+>
+> | 你的情況 | 怎麼做 |
+> |---|---|
+> | 帳號是 Paid 方案，想在 AWS 買網域 | 做 **2.9-1 方法 A**，再做 2.9-2～2.9-6 |
+> | 已經有網域（或在 Namecheap、GoDaddy、Cloudflare 等其他註冊商買） | **跳過方法 A**，做 **2.9-1 方法 B**，再做 2.9-2～2.9-6 |
+> | 沒有網域，也不想升級或另外買 | **整個 2.9 跳過**，繼續用 `dxxxx.cloudfront.net`。Phase 3 的 `SITE_DOMAIN` 填 CloudFront 網域即可，其他步驟不受影響 |
+>
+> 查看自己的方案：主控台右上角帳號名稱 → **Billing and Cost Management** → 左側 **Free plan**（或首頁會顯示 *Free plan*／*Paid plan*）。
+
+#### 2.9-1 準備網域（選用：方法 A 或方法 B 二選一）
+
+這一步的目標只有一個：**讓 Route 53 裡有一個你網域的 Hosted zone，而且網域的 Name server 指向它**。2.9-2 之後的步驟兩種方法都一樣。
+
+##### 方法 A：在 Route 53 註冊新網域（需要 Paid 方案）
+
+> 🆓 **Free 方案帳號不能做這個方法**：按 **Register domains** 會被拒絕或看不到付款選項。請改用方法 B，或跳過整個 2.9。
 
 > ⚠️ **這一步會立刻扣款，而且不能退費。** 送出前請確認網域名稱的拼字。
 
@@ -4083,7 +4099,7 @@ CloudFront：出示 example.com 的憑證（ACM，免費）──► wp-alb ─�
 
 把網域記到「準備 5：數值記錄表」的 `<MY_DOMAIN>`（例如 `example.com`，不要加 `https://`、不要加 `www`）。
 
-✅ **驗證 2.9-1**（CloudShell）：先把第一行換成你的網域：
+✅ **驗證 2.9-1 方法 A**（CloudShell）：先把第一行換成你的網域：
 
 ```bash
 MY_DOMAIN=example.com     # ← 換成你註冊的網域
@@ -4101,6 +4117,67 @@ ZONE_NS=$(aws route53 get-hosted-zone --id $ZONE_ID --query "DelegationSet.NameS
 - 最後一行是 ✅。如果是 ❌，通常是自己又多建了一個同名的 Hosted zone，見 2.9-7 排錯表。
 
 > `route53domains` 指令只能在 `us-east-1` 執行，所以加了 `--region us-east-1`。
+
+##### 方法 B：使用在其他地方已經有的網域（Free 方案也可以）
+
+網域在其他註冊商（例如 Namecheap、GoDaddy、Cloudflare、Gandi）那裡，**DNS 改交給 Route 53 管理**。網域本身不用轉移，也不用在 AWS 付網域費用。
+
+```
+你的註冊商（例如 Namecheap）            Route 53
+  example.com 的 Name server  ──指向──►  Hosted zone：example.com
+  （改成 Route 53 給的 4 個）              （2.9-2 以後的記錄都建在這裡）
+```
+
+> ⚠️ **改 Name server 之後，這個網域原本的 DNS 記錄（例如 Email 的 MX 記錄）會失效。** 如果這個網域已經在使用（例如公司信箱），先把原本的記錄抄下來，在 Route 53 的 Hosted zone 裡重建，或改用一個沒在使用的網域練習。
+
+1. 主控台上方搜尋 **Route 53** → 左側 **Hosted zones** → **Create hosted zone**。
+
+| 欄位 | 設定 | 說明 |
+|---|---|---|
+| **Domain name** | `example.com` | 你的網域，不要加 `www`、不要加 `https://` |
+| **Description** | `wordpress` | 選填 |
+| **Type** | **Public hosted zone** | 讓網際網路上的人都查得到 |
+
+   按 **Create hosted zone**。
+
+2. 建立完成後，點開這個 Hosted zone，**NS** 那一列的 **Value** 有 4 個 Name server，類似：
+
+```
+ns-123.awsdns-15.com.
+ns-456.awsdns-57.net.
+ns-789.awsdns-34.org.
+ns-1011.awsdns-12.co.uk.
+```
+
+   ⚠️ **每個 Hosted zone 的值都不一樣，要用你畫面上的。** 不要再建立第二個同名的 Hosted zone，不然 Name server 會對不上。
+
+3. 登入你的**網域註冊商**網站，找到這個網域的 **Nameservers**（名稱伺服器）設定：
+   - 選 **Custom DNS**（自訂名稱伺服器），各家的名稱略有不同，例如 Namecheap 是 *Custom DNS*，GoDaddy 是 *Change Nameservers → I'll use my own nameservers*。
+   - 把原本的 Name server 刪掉，填入步驟 2 的 **4 個值**。結尾的 `.` 可以不填。
+   - 儲存。
+
+4. 等待生效：通常 10 分鐘到幾小時，少數情況最多 48 小時。
+
+把網域記到「準備 5：數值記錄表」的 `<MY_DOMAIN>`（例如 `example.com`，不要加 `https://`、不要加 `www`）。
+
+✅ **驗證 2.9-1 方法 B**（CloudShell）：先把第一行換成你的網域：
+
+```bash
+MY_DOMAIN=example.com     # ← 換成你的網域
+ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name $MY_DOMAIN --query "HostedZones[?Name=='$MY_DOMAIN.'].Id | [0]" --output text)
+echo "Hosted zone：$ZONE_ID"
+ZONE_NS=$(aws route53 get-hosted-zone --id $ZONE_ID --query "DelegationSet.NameServers" --output text | tr '\t' '\n' | sed 's/\.$//' | tr 'A-Z' 'a-z' | sort | tr '\n' ' ')
+PUB_NS=$(dig +short NS $MY_DOMAIN @8.8.8.8 | sed 's/\.$//' | tr 'A-Z' 'a-z' | sort | tr '\n' ' ')
+echo "Hosted zone 的 Name server：$ZONE_NS"
+echo "網路上查到的 Name server ：$PUB_NS"
+[ -n "$PUB_NS" ] && [ "$ZONE_NS" = "$PUB_NS" ] && echo "✅ 網域已經交給 Route 53 管理" || echo "❌ 還沒生效或填錯，等一下再跑一次"
+```
+
+- `Hosted zone：` 印出 `/hostedzone/Z` 開頭的 ID。如果是 `None`，Hosted zone 沒有建立或名稱打錯。
+- 兩行 Name server 完全相同，最後一行是 ✅，才往 2.9-2 走。
+- 如果是 ❌：剛改完的話等 10–30 分鐘再跑；一直不一樣的話，回到註冊商確認 4 個值都有填對。
+
+> CloudShell 沒有 `dig` 的話，先執行 `sudo dnf install -y bind-utils`。
 
 #### 2.9-2 申請 HTTPS 憑證（ACM，us-east-1）
 
@@ -4370,6 +4447,9 @@ EXP=$(curl -s -m 15 -o /dev/null -w "%{ssl_verify_result}" "https://$MY_DOMAIN/h
 
 | 出現的狀況 | 原因 | 解法 |
 |---|---|---|
+| 方法 A：**Register domains** 被拒絕，或看不到付款選項 | 帳號是 **Free 方案**，不能在 Route 53 註冊網域 | 改用 2.9-1 方法 B（用其他註冊商的網域），或升級成 Paid 方案，或跳過整個 2.9 |
+| 方法 B：Name server 一直對不上 | 註冊商那裡沒有存檔、少填一個，或填的是另一個 Hosted zone 的值 | 回註冊商確認 4 個值和 Hosted zone 的 NS 記錄完全相同；等 30 分鐘再跑驗證 |
+| 方法 B：改完 Name server，Email 收不到信 | 原本註冊商的 MX 等記錄沒有搬到 Route 53 | 在 Hosted zone 裡重建原本的 MX、TXT 記錄 |
 | 網域註冊 Status 是 *Failed* | 聯絡資料不完整，或網域已被別人註冊 | 看 Requests 的錯誤訊息，修正後重新註冊（失敗不會扣款） |
 | 收不到驗證信 | 被歸到垃圾信件 | Route 53 → Registered domains → 點網域 → **Resend email** |
 | 憑證一直是 *Pending validation* | 驗證用的 CNAME 沒有加到 Hosted zone | 憑證頁按 **Create records in Route 53**；或確認 2.9-1 驗證的 Name server 一致 |
@@ -5263,7 +5343,7 @@ R=$(aws logs describe-log-groups --log-group-name-prefix /aws/lambda/wp-ops-agen
 9. **S3** → 進入 `wp-backup-<ACCOUNT_ID>` → **Empty** → 再 **Delete** bucket。
 10. **（做了 2.9）Route 53 → Hosted zones → 你的網域**：刪除自己建立的記錄（4 筆 A／AAAA Alias、ACM 驗證用的 CNAME），**NS、SOA 不用刪** → 回到 Hosted zones 列表，刪除這個 Hosted zone（停止每月 $0.50）。
 11. **（做了 2.9）Certificate Manager（切到 us-east-1）**：CloudFront 刪除後，刪除 `example.com` 的憑證（憑證還被 CloudFront 使用時無法刪除）。
-12. **（做了 2.9）Route 53 → Registered domains → 你的網域** → 關閉 **Auto-renew**。網域無法刪除或退費，會在到期日自動失效。
+12. **（做了 2.9 方法 A）Route 53 → Registered domains → 你的網域** → 關閉 **Auto-renew**。網域無法刪除或退費，會在到期日自動失效。（方法 B：到你的註冊商把 Name server 改回原本的設定）
 
 ### 刪除 Phase 1
 
@@ -5668,6 +5748,7 @@ chmod +x /usr/local/bin/wp
 | 3.7 | 精靈欄位簡略，沒提醒時區預設是 UTC、Retry 要關閉 | 逐欄位表格、CLI 驗證 |
 | 3.8 | 只有主控台做法；網址要手動替換 `<CF_DOMAIN>`；沒有確認 SNS 訂閱 | 新增 CLI 做法、訂閱驗證、步驟化測試與排錯表；支援 2.9 自訂網域 |
 | 3.9（新增） | 沒有整體驗證 | 一鍵驗證 Lambda、環境變數、排程、SNS 訂閱、日誌保留 |
+| 2.9-1（11/02 修改） | 只有在 Route 53 註冊網域；Free 方案帳號無法註冊，卡在這一步 | 2.9-1 改成選用：方法 A（Route 53 註冊，需 Paid 方案）或方法 B（用其他註冊商的網域，自建 Hosted zone、改 Name server），附各自的驗證；開頭加上 Free 方案判斷表；排錯表與清除步驟同步更新 |
 | 準備 5 數值記錄表（10/29 補充） | 沒有 Phase 3 會用到的值 | 新增模型名稱、Slack 頻道與 secret 名稱、角色與 Lambda ARN、程式位置、`SITE_DOMAIN`、巡檢時間；說明「貼上你的…」寫法與敏感值的保存 |
 
 ## v3 修正紀錄
