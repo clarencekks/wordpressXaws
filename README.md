@@ -209,7 +209,7 @@ echo $AWS_REGION
 | Slack Webhook 存放位置：`wp-agent/slack-webhook`（Secrets Manager） | 3.2 | ⚠️ 只記名稱，**不要**把 Webhook 網址寫在這裡 |
 | Agent 角色 ARN（`arn:aws:iam::<帳號>:role/wp-agent-role`） | 3.3 | |
 | Lambda 程式位置（`s3://wp-backup-<帳號>/lambda/agent.zip`） | 3.5 | |
-| Agent 檢查的網站網域 `SITE_DOMAIN`（`<MY_DOMAIN>` 或 `<CF_DOMAIN>`，不加 `https://`） | 3.6 | |
+| Agent 檢查的網站網域 `SITE_DOMAIN`（3.6 會**自動取得** `<CF_DOMAIN>`；只有做了選用的 2.9 才改成 `<MY_DOMAIN>`） | 3.6 | |
 | Lambda 函數 ARN（`arn:aws:lambda:ap-northeast-1:<帳號>:function:wp-ops-agent`） | 3.6 | |
 | 每日巡檢時間（預設 09:00 Asia/Taipei，排程名稱 `wp-daily-health-check`） | 3.7 | |
 
@@ -4023,6 +4023,9 @@ aws cloudwatch set-alarm-state --alarm-name wp-5xx-high --state-value ALARM --st
 
 ### 2.9 用自己的網域（Route 53）
 
+> ⏭️ **選用，不需要做。** 本指南預設**不設定 Route 53**，網站一直用 CloudFront 的 `https://dxxxx.cloudfront.net`，功能完全一樣。**Phase 3 也不需要 2.9**，Agent 會自動找到 CloudFront 網址。
+> 不做的話，直接跳到「[Phase 2 完成檢查表](#-phase-2-完成檢查表)」。以後想要自己的網域時，再回來做這一節。
+
 **為什麼需要**：現在的網址 `https://d1234abcd.cloudfront.net` 很難記，也看不出是誰的網站。這一步會用 **Route 53** 註冊一個自己的網域（以下用 `example.com` 舉例），讓訪客用 `https://example.com` 連到網站，HTTPS 憑證一樣免費。
 
 ```
@@ -4475,13 +4478,13 @@ EXP=$(curl -s -m 15 -o /dev/null -w "%{ssl_verify_result}" "https://$MY_DOMAIN/h
 
 ### ✅ Phase 2 完成檢查表
 
-- [ ] `https://<CF_DOMAIN>` 有鎖頭並能登入後台（做了 2.9 的話改成 `https://<MY_DOMAIN>`）
+- [ ] `https://<CF_DOMAIN>` 有鎖頭並能登入後台（有做選用的 2.9 的話改成 `https://<MY_DOMAIN>`）
 - [ ] 直接連 ALB 或主機都被擋下
 - [ ] Terminate 主機後 ASG 會自動補上
 - [ ] S3 `db/` 有每日備份
 - [ ] 舊 Elastic IP 已釋放
 - [ ] `wp-5xx-high` 告警為 OK
-- [ ] （做了 2.9）`https://www.<MY_DOMAIN>` 會轉到 `https://<MY_DOMAIN>`，2.9-6 驗證全部 ✅
+- [ ] （選用，沒做 2.9 就不用打勾）`https://www.<MY_DOMAIN>` 會轉到 `https://<MY_DOMAIN>`，2.9-6 驗證全部 ✅
 
 ---
 
@@ -4562,11 +4565,14 @@ T=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':wp-alerts')].Topi
 [ "$T" != "None" ] && echo "✅ SNS 主題 wp-alerts 存在" || echo "❌ 找不到 SNS 主題 wp-alerts（1.12）"
 A=$(aws cloudwatch describe-alarms --alarm-names wp-5xx-high --query "length(MetricAlarms)" --output text)
 [ "$A" = "1" ] && echo "✅ 告警 wp-5xx-high 存在" || echo "⚠️ 找不到 wp-5xx-high（2.8），3.8 的自動診斷會用到"
+CF_DOMAIN=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].DomainName | [0]" --output text)
+H=$(curl -s --max-time 10 "https://$CF_DOMAIN/healthz")
+[ "$H" = "ok" ] && echo "✅ 網站網址 https://$CF_DOMAIN 正常（Agent 會檢查這個網址）" || echo "❌ https://$CF_DOMAIN/healthz 沒有回應 ok（$H），回到 2.4／2.5 驗證"
 ```
 
-全部 ✅ 才往下做。
+全部 ✅ 才往下做。最後一行印出的 `dxxxx.cloudfront.net` 就是 Agent 要檢查的網址，3.6 會自動帶入，**不需要 Route 53 或自己的網域**。
 
-> 只做了 Phase 1？也可以做 Phase 3：先照 2.1 步驟 1 建立 S3 bucket；3.6 的網址改填 `http://<EIP>`；略過 3.8。
+> 只做了 Phase 1？也可以做 Phase 3：先照 2.1 步驟 1 建立 S3 bucket；3.0 最後一行的 ❌ 可以忽略；3.6 把 `SITE_URL=` 那一行改成 `SITE_URL="http://你的EIP/"`；略過 3.8。
 
 ### 3.1 開通 Bedrock 的 Claude 模型
 
@@ -5053,18 +5059,22 @@ aws s3 cp agent.zip s3://$BUCKET/lambda/agent.zip
 
 **為什麼需要**：Lambda 是 AWS 的「按次執行」服務，有任務才啟動、做完就關，**不用一直開著一台主機**，所以幾乎不花錢。
 
-在 CloudShell **先把前兩行雙引號裡的文字換成你的值**，再整段貼上：
+在 CloudShell **先把第一行雙引號裡的文字換成你的 `MODEL_ID`**，再整段貼上。網站網址會自動從 CloudFront 取得，不用填：
 
 ```bash
 MODEL_ID="貼上你的MODEL_ID"      # ← 3.1 查到的 ID（保留雙引號）
-SITE_DOMAIN="貼上你的網域"        # ← 網站網域，不要加 https://。做了 2.9 填你的網域（例如 example.com），否則填 dxxxx.cloudfront.net
+CF_DOMAIN=$(aws cloudfront list-distributions --query "DistributionList.Items[?contains(Origins.Items[0].DomainName, 'wp-alb')].DomainName | [0]" --output text)
+SITE_DOMAIN=$CF_DOMAIN             # 有做選用的 2.9 才改成：SITE_DOMAIN=example.com
+SITE_URL="https://$SITE_DOMAIN/"
+echo "Agent 會檢查的網址：$SITE_URL"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 # 沒有設定 Slack（跳過 3.2）的話，把下一行改成：SLACK_SECRET_ID=
 SLACK_SECRET_ID=wp-agent/slack-webhook
 
-case "$MODEL_ID$SITE_DOMAIN" in
-  *貼上*|*"<"*|*">"*|*"https://"*) echo "❌ 前兩行還沒換成你的值（或網域多了 https://），這次不會建立";;
+case "$MODEL_ID|$SITE_DOMAIN" in
+  *貼上*|*"<"*|*">"*) echo "❌ 第一行還沒換成你的 MODEL_ID，這次不會建立";;
+  *"|"|*"|None") echo "❌ 找不到 CloudFront 網址，先跑 3.0 確認 2.4 的 CloudFront 存在，這次不會建立";;
   *)
     aws lambda create-function --function-name wp-ops-agent \
       --runtime python3.12 --architectures x86_64 \
@@ -5072,7 +5082,7 @@ case "$MODEL_ID$SITE_DOMAIN" in
       --handler lambda_function.handler \
       --code S3Bucket=wp-backup-$ACCOUNT_ID,S3Key=lambda/agent.zip \
       --timeout 300 --memory-size 512 \
-      --environment "Variables={MODEL_ID=$MODEL_ID,SITE_URL=https://$SITE_DOMAIN/,SLACK_SECRET_ID=$SLACK_SECRET_ID}" \
+      --environment "Variables={MODEL_ID=$MODEL_ID,SITE_URL=$SITE_URL,SLACK_SECRET_ID=$SLACK_SECRET_ID}" \
       --query "FunctionArn" --output text
     aws lambda wait function-active-v2 --function-name wp-ops-agent && echo "✅ Lambda 已就緒"
 
@@ -5094,6 +5104,7 @@ esac
 | Reserved concurrency | 2 | 最多同時執行 2 次。告警短時間內響很多次時，不會同時開一堆 Agent、燒掉 Bedrock 費用 |
 | Retry attempts | 0 | 自動觸發失敗時不重試，避免同一個告警產生 3 份重複報告 |
 | 日誌保留 | 30 天 | CloudWatch Logs 預設永久保存，會越積越多 |
+| `SITE_URL` | 自動取得的 `https://dxxxx.cloudfront.net/` | 從 2.4 的 CloudFront（來源是 `wp-alb`）查出網域，不用手動貼，也不需要 Route 53 |
 
 - 出現 `The role defined for the function cannot be assumed by Lambda`：3.3 的角色剛建立還沒生效，等 10 秒再整段重貼。
 - 出現 `ResourceConflictException`：Lambda 已經建立過。要更新設定的話，用下面「之後修改程式」的方法。
@@ -5246,13 +5257,15 @@ chown apache:apache /var/www/html/wp-content/mu-plugins/boom-test.php && echo "�
 - `mu-plugins`（Must-Use plugins）是 WordPress 會自動載入的外掛資料夾。檔案在 EFS 上，所有主機都會套用。
 - 只有網址帶 `?boom=1` 才會出錯，一般訪客不受影響。
 
-**步驟 2**：在 **CloudShell** 先把第一行雙引號裡的文字換成你的網域，再整段貼上，打 20 次觸發 500：
+**步驟 2**：在 **CloudShell** 整段貼上，打 20 次觸發 500。網址直接用 3.6 存在 Lambda 裡的 `SITE_URL`，不用填：
 
 ```bash
-SITE_DOMAIN="貼上你的網域"      # ← 和 3.6 相同的網域（保留雙引號）
-if echo "$SITE_DOMAIN" | grep -q "貼上"; then echo "❌ 第一行還沒換成你的網域"; else
-for i in $(seq 1 20); do curl -s -o /dev/null -w "%{http_code} " "https://$SITE_DOMAIN/?boom=1&n=$i"; done; echo
-fi
+SITE_URL=$(aws lambda get-function-configuration --function-name wp-ops-agent --query "Environment.Variables.SITE_URL" --output text)
+echo "測試網址：$SITE_URL"
+case "$SITE_URL" in
+  https://*|http://*) for i in $(seq 1 20); do curl -s -o /dev/null -w "%{http_code} " "${SITE_URL}?boom=1&n=$i"; done; echo;;
+  *) echo "❌ 讀不到 Lambda 的 SITE_URL，先完成 3.6";;
+esac
 ```
 
 畫面應該印出 20 個 `500`。（`n=$i` 讓每次網址都不同，避免被 CloudFront 快取。）
@@ -5282,7 +5295,10 @@ rm -f /var/www/html/wp-content/mu-plugins/boom-test.php && echo "✅ 測試外�
 F=$(aws lambda get-function --function-name wp-ops-agent --query "Configuration.[State, Runtime, Timeout]" --output text 2>/dev/null)
 echo "$F" | grep -q "^Active" && echo "✅ Lambda wp-ops-agent：$F" || echo "❌ Lambda 不存在或不是 Active（$F）"
 ENV=$(aws lambda get-function-configuration --function-name wp-ops-agent --query "Environment.Variables.[MODEL_ID, SITE_URL]" --output text)
-echo "$ENV" | grep -q "<" && echo "❌ 環境變數還有 < >：$ENV" || echo "✅ 環境變數：$ENV"
+echo "$ENV" | grep -q "<\|貼上" && echo "❌ 環境變數還有沒替換的文字：$ENV" || echo "✅ 環境變數：$ENV"
+SITE_URL=$(aws lambda get-function-configuration --function-name wp-ops-agent --query "Environment.Variables.SITE_URL" --output text)
+H=$(curl -s --max-time 10 "${SITE_URL%/}/healthz")
+[ "$H" = "ok" ] && echo "✅ Agent 檢查的網址 $SITE_URL 正常" || echo "❌ ${SITE_URL%/}/healthz 沒有回應 ok（$H）"
 S=$(aws scheduler get-schedule --name wp-daily-health-check --query "State" --output text 2>/dev/null)
 [ "$S" = "ENABLED" ] && echo "✅ 每日巡檢排程已啟用" || echo "❌ 每日巡檢排程：$S"
 TOPIC_ARN=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':wp-alerts')].TopicArn | [0]" --output text)
@@ -5757,6 +5773,7 @@ chmod +x /usr/local/bin/wp
 | 3.7 | 精靈欄位簡略，沒提醒時區預設是 UTC、Retry 要關閉 | 逐欄位表格、CLI 驗證 |
 | 3.8 | 只有主控台做法；網址要手動替換 `<CF_DOMAIN>`；沒有確認 SNS 訂閱 | 新增 CLI 做法、訂閱驗證、步驟化測試與排錯表；支援 2.9 自訂網域 |
 | 3.9（新增） | 沒有整體驗證 | 一鍵驗證 Lambda、環境變數、排程、SNS 訂閱、日誌保留 |
+| 2.9、Phase 3（11/02 修改） | 2.9 看起來像必做；Phase 3 的 3.6、3.8 要手動貼網域，提到「做了 2.9 填你的網域」 | 2.9 開頭標明**選用、不需要做**；3.0 新增網站網址檢查；3.6 自動從 CloudFront 取得 `SITE_URL`，只需貼 `MODEL_ID`；3.8 直接讀 Lambda 的 `SITE_URL`；3.9 新增網址可連檢查；數值記錄表、Phase 2 檢查表同步調整。**Phase 3 不需要 Route 53** |
 | 2.9-1（11/02 修改） | 只有在 Route 53 註冊網域；Free 方案帳號無法註冊，卡在這一步 | 2.9-1 改成選用：方法 A（Route 53 註冊，需 Paid 方案）或方法 B（用其他註冊商的網域，自建 Hosted zone、改 Name server），附各自的驗證；開頭加上 Free 方案判斷表；排錯表與清除步驟同步更新 |
 | 準備 5 數值記錄表（10/29 補充） | 沒有 Phase 3 會用到的值 | 新增模型名稱、Slack 頻道與 secret 名稱、角色與 Lambda ARN、程式位置、`SITE_DOMAIN`、巡檢時間；說明「貼上你的…」寫法與敏感值的保存 |
 
